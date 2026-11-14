@@ -1,0 +1,36 @@
+import { expect, test } from 'bun:test';
+import { loadEnv } from '../../src/config/env';
+
+const valid = {
+  PORT: '3000',
+  DATABASE_URL: 'postgres://u:p@h:5432/db',
+  AWS_REGION: 'us-east-1',
+  AWS_ENDPOINT_URL: 'http://localhost:4566',
+  AWS_ACCESS_KEY_ID: 'test',
+  AWS_SECRET_ACCESS_KEY: 'test',
+  SQS_WAGER_QUEUE: 'wager-transactions.fifo',
+  SQS_WAGER_DLQ: 'wager-transactions-dlq.fifo',
+  SQS_EVENTS_QUEUE: 'wallet-events.fifo',
+};
+
+test('carrega env válida', () => {
+  const env = loadEnv(valid);
+  expect(env.port).toBe(3000);
+  expect(env.queues.wager).toBe('wager-transactions.fifo');
+});
+
+test('falha nomeando a variável ausente', () => {
+  const { DATABASE_URL: _, ...rest } = valid;
+  expect(() => loadEnv(rest)).toThrow('DATABASE_URL');
+});
+
+test('trata string vazia ou só com espaços como ausente', () => {
+  expect(() => loadEnv({ ...valid, SQS_EVENTS_QUEUE: '' })).toThrow('SQS_EVENTS_QUEUE');
+  expect(() => loadEnv({ ...valid, DATABASE_URL: '   ' })).toThrow('DATABASE_URL');
+});
+
+test('PORT precisa ser inteiro entre 1 e 65535', () => {
+  for (const PORT of ['abc', ' ', '0', '70000', '3000.5']) {
+    expect(() => loadEnv({ ...valid, PORT })).toThrow('PORT');
+  }
+});
