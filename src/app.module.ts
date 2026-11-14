@@ -4,6 +4,12 @@ import { ENV, type Env } from './config/env';
 import { SqsGateway } from './infrastructure/messaging/sqs.gateway';
 import { HealthController } from './infrastructure/observability/health.controller';
 import { createOrmConfig } from './infrastructure/persistence/mikro-orm.config';
+import { WagerQueries } from './infrastructure/persistence/wager.queries';
+import { WagerTransactionsController } from './infrastructure/http/wager-transactions.controller';
+import { WalletsController } from './infrastructure/http/wallets.controller';
+import { OpenWallet } from './application/open-wallet';
+import { ProcessWagerTransaction } from './application/process-wager-transaction';
+import { ReconcileWallet } from './application/reconcile-wallet';
 
 @Module({})
 export class AppModule {
@@ -12,8 +18,15 @@ export class AppModule {
     return {
       module: AppModule,
       imports: [MikroOrmModule.forRoot(createOrmConfig(env))],
-      controllers: [HealthController],
-      providers: [{ provide: ENV, useValue: env }, SqsGateway],
+      controllers: [HealthController, WalletsController, WagerTransactionsController],
+      providers: [
+        { provide: ENV, useValue: env },
+        SqsGateway,
+        WagerQueries,
+        ProcessWagerTransaction,
+        OpenWallet,
+        ReconcileWallet,
+      ],
     };
   }
 }

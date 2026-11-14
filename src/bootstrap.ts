@@ -3,9 +3,11 @@ import type { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import type { Env } from './config/env';
+import { ErrorFilter } from './infrastructure/http/error.filter';
 
 export async function createApp(env: Env): Promise<INestApplication> {
   const app = await NestFactory.create(AppModule.register(env));
+  app.useGlobalFilters(new ErrorFilter());
   app.enableShutdownHooks(); // SIGTERM fecha o app de forma ordenada (consumer na parte 5)
   return app;
 }
