@@ -217,12 +217,13 @@ lista é uma migration simples, sem `ALTER TYPE`).
 | Transação é auditável | trigger: linha terminal não muda; nenhuma linha é apagada; campos do payload (os que entram no `payload_hash`) nunca mudam |
 | Status coerente com os campos | `processed_at` ⇔ `PROCESSED`; `failure_code` ⇔ `REJECTED`/`FAILED` |
 | Inbox deduplica | `PRIMARY KEY (consumer_name, message_id)` |
+| Replay devolve o saldo daquele momento (regra 7) | `observed_balance` obrigatório em `PROCESSED`/`REJECTED` |
 
 `wager_transactions` **não** tem FK de moeda nem de player com a wallet de propósito: uma transação
 rejeitada por `CURRENCY_MISMATCH` ou `WALLET_PLAYER_MISMATCH` precisa ficar gravada para auditoria.
 
-Índices além das constraints: `(wallet_id, created_at, id)` no ledger (histórico por cursor e
-reconciliação), parcial `WHERE status = 'PENDING_REFERENCE'` para achar quem espera uma referência,
+Índices além das constraints: `UNIQUE (wallet_id, wallet_version)` no ledger (histórico por
+cursor, uma versão = um lançamento), parcial `WHERE status = 'PENDING_REFERENCE'` para achar quem espera uma referência,
 parcial `WHERE published_at IS NULL` para o publisher da outbox.
 
 Cada linha da tabela acima tem um teste em `test/integration/schema.test.ts` que tenta violá-la.
@@ -234,7 +235,95 @@ de imutabilidade é erro de programação, e o app consegue diferenciar de um `C
 
 O que o banco **não** garante (fica no domínio): que a referência é da mesma wallet/provider/rodada
 e do tipo certo, que só transação `PROCESSED` gera lançamento, e que `wallets.balance` é igual ao
-último `balance_after` do ledger (a reconciliação da parte 4 confere isso).
+último `balance_after` do ledger (o endpoint de reconciliação compara o saldo com a soma do ledger).
+
+## Processamento de uma transação (`src/application`)
+
+`ProcessWagerTransaction` é o único caminho de uma transação de aposta — a API usa hoje e o
+consumer SQS vai usar o mesmo. Tudo numa transação SQL só, nesta ordem:
+
+1. `SELECT … FOR UPDATE` na wallet (com `lock_timeout` de 5 s).
+2. Idempotência: já existe transação com a mesma idempotency key ou o mesmo id externo do provider?
+3. `applyWager` (domínio puro) decide.
+4. Grava a transação → o lançamento → o saldo → os eventos na outbox.
+
+### Concorrência: lock pessimista por wallet
+
+A unidade de concorrência é a wallet, e o lock é na linha dela no Postgres. Isso dá:
+
+- tudo da mesma wallet serializado (idempotência, resolução de referência, saldo) — sem lost update;
+- wallets diferentes em paralelo (nada de lock global);
+- correção com N instâncias, porque quem segura o lock é o banco, não o processo.
+
+**Por que não optimistic locking:** numa hot wallet (muitas apostas disputando o mesmo saldo), o
+optimistic faz quase todo mundo perder a corrida e tentar de novo. Com o lock pessimista cada
+transação espera a vez uma única vez. O custo é a espera em fila numa wallet muito disputada — o
+`lock_timeout` impede que isso pendure: estourou, a API responde 503 e o provedor reenvia.
+
+`version` continua existindo (incrementa só quando o saldo muda) e serve de ordem do ledger.
+
+### Idempotência
+
+Dentro do lock, busca por `(provider, idempotency_key)` ou `(provider, id externo)`:
+
+- mesma key **e** mesmo hash → replay: a resposta original com `idempotentReplay: true`;
+- qualquer outra coincidência → 409 conflito (nunca replay).
+
+A deduplicação é toda no banco (constraints únicas), nada em memória. Corrida com a mesma key
+para wallets diferentes (locks diferentes): a constraint de idempotência estoura, a transação é
+refeita (até 3 vezes) e na segunda passada cai no replay ou no conflito. Só essas duas constraints
+disparam o retry; qualquer outra violação é bug e sobe como 500.
+
+O payload é validado pelo domínio **antes** de pegar o lock: payload inválido não segura a wallet.
+
+**Hash do payload:** SHA-256 em hex do JSON canônico — chaves em ordem alfabética, sem espaços,
+campos ausentes omitidos — dos campos de negócio: `providerId`, `externalTransactionId`,
+`playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money` e `referenceExternalTransactionId`.
+O `money` passa pelo `Money` antes, então `"25.0"` e `"25.00"` são o mesmo payload. O header
+`Idempotency-Key` e metadados de transporte ficam de fora.
+
+**Regra 7 (saldo observado):** cada transação grava `observed_balance`, o saldo da wallet quando
+ela foi decidida. O replay devolve esse valor, inclusive para LOSS e REJECTED, que não têm lançamento.
+
+### Camadas
+
+`src/application` orquestra; `wager.repository.ts` faz o SQL dentro da transação. Não há interface
+de repositório: existe uma implementação só, e os testes usam Postgres real (o desafio proíbe
+substituir o banco por mock), então a interface seria cerimônia sem uso.
+
+## API HTTP
+
+| Situação | Status | Corpo |
+|---|---|---|
+| Transação PROCESSED (primeira vez ou replay) | 200 | resultado |
+| Wallet criada | 201 | wallet |
+| Transação aceita, aguardando a referência | 202 | resultado com `PENDING_REFERENCE` |
+| Payload inválido, header `Idempotency-Key` ausente | 400 | `{ error, message }` |
+| Wallet ou transação não existe | 404 | `{ error, message }` |
+| Conflito de idempotência, wallet duplicada | 409 | `{ error, message }` |
+| Rejeitada por regra de negócio | 422 | resultado com `failureCode` |
+| Falha transitória (conexão, lock timeout, deadlock) | 503 + `Retry-After` | `{ error, message }` |
+| Bug | 500 | `{ error, message }` |
+
+O provedor decide só pelo status: 200/202/422 são respostas definitivas (reenviar devolve a mesma
+coisa), 400/409 pedem correção do payload, 503 pode reenviar, 404 é wallet errada.
+
+O replay devolve o estado gravado da transação: igual à primeira resposta, com uma exceção — uma
+PENDING_REFERENCE (202) resolvida depois responde com o desfecho (200 ou 422). Quem resolver a
+pendência (worker da parte 5) grava o saldo observado do momento da decisão.
+
+**503 de verdade:** o conversor de erros do MikroORM para Postgres só reconhece deadlock; lock
+timeout e conexão recusada chegam como erro genérico. Por isso `transient-errors.ts` olha o SQLSTATE
+do Postgres (`55P03` lock timeout, `08xxx` conexão, `57P0x` banco reiniciando, `53300` conexões
+esgotadas) e o código de rede do Node. Os dois casos principais têm teste (wallet travada além do
+`lock_timeout` e Postgres fora do ar).
+
+- **Ledger:** `GET /wallets/:id/ledger?cursor=&limit=` (padrão 50, máximo 200). O cursor é a
+  `wallet_version` do último item em base64url: atribuída sob o lock, é estritamente crescente por
+  wallet, então a página nunca pula nem repete item (`created_at` dependeria do relógio de cada instância).
+- **Reconciliação:** saldo gravado × créditos − débitos do ledger, lidos na mesma foto do banco
+  (`REPEATABLE READ`). Divergência é logada e sinalizada em `consistent: false`; nunca corrigida.
+- `providerId = "internal"` é reservado para as transações OPENING e recusado na API.
 
 ## Interpretações das regras de negócio
 
@@ -289,3 +378,12 @@ ser pago. Não alterei: fica para alinhar com o time, junto com a regra 4.
 - Migrations sem lock: a garantia de execução única vem do serviço `migrate` do compose. Rodar
   `migration:up` de vários lugares ao mesmo tempo não é seguro.
 - O container roda `bun src/main.ts` direto: via `bun run` o SIGTERM terminava em crash (exit 139).
+- Uma wallet muito disputada vira fila no lock: a latência cresce com a disputa (correção acima de vazão).
+- Transações PENDING_REFERENCE ficam paradas até o worker da parte 5 reprocessá-las.
+- `POST /wallets` não é idempotente: se o cliente perder a resposta e reenviar, recebe 409 e
+  precisa descobrir o id por outro caminho (o desafio não pede busca de wallet por player).
+- A migration 2 preenche `wallet_version` e `observed_balance` das linhas antigas a partir do
+  ledger; transações antigas sem lançamento (LOSS/REJECTED) ficam sem saldo observado, por isso a
+  regra entrou como `NOT VALID` (vale para linhas novas).
+- Reconciliação soma créditos e débitos de toda a vida da wallet: acima de 10^18 de movimento
+  acumulado a soma não cabe no `Money` (limite de `NUMERIC(20,2)`).

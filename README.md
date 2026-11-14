@@ -30,6 +30,32 @@ curl localhost:3000/health/live    # {"status":"ok"}
 curl localhost:3000/health/ready   # {"status":"ok","checks":{"postgres":"up","sqs":"up"}}
 ```
 
+## API
+
+```bash
+# abrir wallet
+curl -X POST localhost:3000/wallets -H 'content-type: application/json' \
+  -d '{"playerId":"player-1","initialBalance":{"amount":"100.00","currency":"BRL"}}'
+
+# enviar uma aposta (troque <walletId>)
+curl -X POST localhost:3000/wagering/transactions -H 'content-type: application/json' \
+  -H 'Idempotency-Key: provider-a:tx-1' \
+  -d '{"providerId":"provider-a","externalTransactionId":"tx-1","playerId":"player-1","walletId":"<walletId>",
+       "roundId":"round-1","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
+```
+
+| Endpoint | |
+|---|---|
+| `POST /wallets` | Abre wallet (saldo inicial gera transação OPENING + lançamento) |
+| `GET /wallets/:walletId` | Saldo e versão |
+| `GET /wallets/:walletId/ledger?cursor=&limit=` | Histórico paginado |
+| `POST /wallets/:walletId/reconciliation` | Saldo gravado × ledger |
+| `POST /wagering/transactions` | BET, WIN, LOSS, REFUND, ROLLBACK (header `Idempotency-Key` obrigatório) |
+| `GET /wagering/transactions/:transactionId` | Transação pelo id interno |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | Transação pelo id do provider |
+
+Status HTTP de cada situação: [ARCHITECTURE.md](ARCHITECTURE.md#api-http).
+
 ## Múltiplas instâncias
 
 ```bash
@@ -50,7 +76,10 @@ A faixa de portas suporta até 3 réplicas; para mais, amplie `ports` do serviç
 | `migration:create` / `migration:up` / `migration:down` | Cria / aplica / reverte migrations. Migration nova precisa ser registrada em `src/infrastructure/persistence/migrations/index.ts` |
 | `test` | Testes de unidade (sem containers) |
 | `test:integration` | Testes de integração (exige `infra:up`) |
-| `test:concurrency` | Testes de concorrência (exige `infra:up`) |
+| `test:concurrency` | Testes de concorrência, incluindo 3 processos do app ao mesmo tempo (exige `infra:up`) |
+
+Os testes de integração e concorrência criam bancos próprios (`wagering_test_<suíte>`), recriados a
+cada execução: nunca tocam o banco de desenvolvimento.
 
 ## Observações
 
