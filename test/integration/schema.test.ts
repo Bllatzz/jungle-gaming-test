@@ -214,6 +214,12 @@ describe('wager_transactions', () => {
     await expect(insert(WagerTransactionEntity, row)).rejects.toBeInstanceOf(CheckConstraintViolationException);
   });
 
+  test('tentativas do worker de referências não podem ser negativas', async () => {
+    const { wallet } = await seedWallet();
+    const row = { ...txRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00')), referenceAttempts: -1 };
+    await expect(insert(WagerTransactionEntity, row)).rejects.toBeInstanceOf(CheckConstraintViolationException);
+  });
+
   test('valor zero só é aceito em LOSS', async () => {
     const { wallet } = await seedWallet();
     const loss = txRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Loss, '0.00'));

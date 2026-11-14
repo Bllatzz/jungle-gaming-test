@@ -1,10 +1,14 @@
 import { type EntityManager, LockMode } from '@mikro-orm/core';
+import type { InboxMessage } from '../../domain/inbox-message';
 import type { WalletLedgerEntry } from '../../domain/ledger-entry';
 import type { Money } from '../../domain/money';
 import type { OutboxMessage } from '../../domain/outbox-message';
 import { type WagerTransaction, type WagerTransactionKind, WagerTransactionStatus } from '../../domain/wager-transaction';
 import type { Wallet } from '../../domain/wallet';
-import { LedgerEntryEntity, OutboxMessageEntity, WagerTransactionEntity, type WagerTransactionRow, WalletEntity } from './entities';
+import {
+  InboxMessageEntity, type InboxMessageRow, LedgerEntryEntity, OutboxMessageEntity, WagerTransactionEntity,
+  type WagerTransactionRow, WalletEntity,
+} from './entities';
 import * as map from './mappers';
 
 /** Lock de wallet que demora mais que isso vira erro transitório (503) em vez de pendurar a requisição. */
@@ -66,5 +70,76 @@ export class WagerRepository {
 
   async enqueue(messages: OutboxMessage[]): Promise<void> {
     if (messages.length > 0) await this.em.insertMany(OutboxMessageEntity, messages.map(map.toOutboxMessageRow));
+  }
+
+  async findInbox(consumerName: string, messageId: string): Promise<InboxMessageRow | undefined> {
+    return (await this.em.findOne(InboxMessageEntity, { consumerName, messageId })) ?? undefined;
+  }
+
+  async insertInbox(message: InboxMessage): Promise<void> {
+    await this.em.insert(InboxMessageEntity, map.toInboxMessageRow(message));
+  }
+
+  /**
+   * Eventos pendentes e vencidos, travados com SKIP LOCKED: publishers concorrentes pegam lotes
+   * disjuntos, e o lock vale até o commit (que grava publishedAt ou o próximo retry).
+   */
+  async claimDueOutbox(now: Date, limit: number): Promise<OutboxMessage[]> {
+    const rows = await this.em.find(
+      OutboxMessageEntity,
+      { publishedAt: null, $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: now } }] },
+      { orderBy: { occurredAt: 'asc', id: 'asc' }, limit, lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE },
+    );
+    return rows.map(map.toOutboxMessage);
+  }
+
+  async saveOutbox(messages: OutboxMessage[]): Promise<void> {
+    for (const message of messages) {
+      const { attempts, nextAttemptAt, publishedAt } = map.toOutboxMessageRow(message);
+      await this.em.nativeUpdate(OutboxMessageEntity, { id: message.id }, { attempts, nextAttemptAt, publishedAt });
+    }
+  }
+
+  /** PENDING_REFERENCE com a próxima tentativa vencida (null = ainda não tentada pelo worker). */
+  async duePendingReferences(now: Date, limit: number): Promise<{ id: string; walletId: string }[]> {
+    return this.em.find(
+      WagerTransactionEntity,
+      {
+        status: WagerTransactionStatus.PendingReference,
+        $or: [{ nextReferenceAttemptAt: null }, { nextReferenceAttemptAt: { $lte: now } }],
+      },
+      { fields: ['id', 'walletId'], orderBy: { nextReferenceAttemptAt: 'asc nulls first', id: 'asc' }, limit },
+    );
+  }
+
+  async postponePendingReference(id: string, until: Date): Promise<void> {
+    await this.em.nativeUpdate(
+      WagerTransactionEntity, { id, status: WagerTransactionStatus.PendingReference }, { nextReferenceAttemptAt: until },
+    );
+  }
+
+  async findTransaction(id: string): Promise<WagerTransactionRow | undefined> {
+    return (await this.em.findOne(WagerTransactionEntity, { id })) ?? undefined;
+  }
+
+  /** Grava o novo estado de uma PENDING_REFERENCE reavaliada (o trigger recusa se ela já for terminal). */
+  async updatePendingTransaction(
+    transaction: WagerTransaction, observedBalance: Money, schedule: { attempts: number; nextAttemptAt: Date | null },
+  ): Promise<void> {
+    const row = map.toWagerTransactionRow(transaction, observedBalance);
+    const updated = await this.em.nativeUpdate(
+      WagerTransactionEntity,
+      { id: transaction.id, status: WagerTransactionStatus.PendingReference },
+      {
+        status: row.status,
+        referenceTransactionId: row.referenceTransactionId,
+        failureCode: row.failureCode,
+        processedAt: row.processedAt,
+        observedBalance: row.observedBalance,
+        referenceAttempts: schedule.attempts,
+        nextReferenceAttemptAt: schedule.nextAttemptAt,
+      },
+    );
+    if (updated !== 1) throw new Error(`Transação ${transaction.id} não estava mais em PENDING_REFERENCE`);
   }
 }

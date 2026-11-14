@@ -40,11 +40,14 @@ export function toWagerTransactionRow(transaction: WagerTransaction, observedBal
     failureCode: failureCode ?? null,
     processedAt: processedAt ?? null,
     observedBalance: observedBalance?.toString() ?? null,
+    referenceAttempts: 0, // agenda do worker de referências: começa já (null)
+    nextReferenceAttemptAt: null,
   };
 }
 
 export function toWagerTransaction(row: WagerTransactionRow): WagerTransaction {
-  const { amount, currency, referenceExternalTransactionId, referenceTransactionId, failureCode, processedAt, observedBalance: _, ...rest } = row;
+  const { amount, currency, referenceExternalTransactionId, referenceTransactionId, failureCode, processedAt, observedBalance: _o,
+    referenceAttempts: _a, nextReferenceAttemptAt: _n, ...rest } = row;
   return WagerTransaction.rehydrate({
     ...rest,
     money: money(amount, currency),

@@ -45,6 +45,8 @@ export const WagerTransactionEntity = defineEntity({
     createdAt: p.datetime(),
     processedAt: p.datetime().nullable(),
     observedBalance: p.decimal('string').precision(20).scale(2).nullable(),
+    referenceAttempts: p.integer().default(0),
+    nextReferenceAttemptAt: p.datetime().nullable(),
   },
 });
 export type WagerTransactionRow = InferEntity<typeof WagerTransactionEntity>;
