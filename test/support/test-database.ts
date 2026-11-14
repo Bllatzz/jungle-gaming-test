@@ -28,3 +28,13 @@ export async function freshTestDatabase(suite: string, migrate = false): Promise
   }
   return testEnv;
 }
+
+/** Invariante final (§13) de uma vez, para o banco inteiro da suíte: wallets cujo saldo ≠ saldo reconstruído pelo ledger. */
+export async function walletsDivergingFromLedger(orm: MikroORM): Promise<{ id: string; balance: string }[]> {
+  return orm.em.fork().getConnection().execute(`
+    select w.id, w.balance::text as balance
+    from wallets w
+    left join wallet_ledger_entries l on l.wallet_id = w.id
+    group by w.id
+    having w.balance <> coalesce(sum(case l.direction when 'CREDIT' then l.amount else -l.amount end), 0)`);
+}

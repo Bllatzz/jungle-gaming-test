@@ -8,7 +8,7 @@ import { LedgerEntryEntity, OutboxMessageEntity, WagerTransactionEntity } from '
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { WagerTransactionStatus } from '../../src/domain/wager-transaction';
 import * as api from '../support/api-client';
-import { freshTestDatabase } from '../support/test-database';
+import { freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
 
 let app: INestApplication;
 let orm: MikroORM;
@@ -269,5 +269,9 @@ describe('consultas', () => {
     );
     expect(row.n).toBe(0);
     expect(await orm.em.fork().count(WagerTransactionEntity, { observedBalance: null, status: { $in: [WagerTransactionStatus.Processed, WagerTransactionStatus.Rejected] } })).toBe(0);
+  });
+
+  test('invariante final: saldo == ledger em todas as wallets da suíte (exceto a adulterada de propósito)', async () => {
+    expect(await walletsDivergingFromLedger(orm)).toEqual([{ id: expect.any(String), balance: '90.00' }]);
   });
 });

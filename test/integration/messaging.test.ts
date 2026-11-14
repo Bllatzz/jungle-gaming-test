@@ -14,7 +14,7 @@ import {
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { WagerRepository } from '../../src/infrastructure/persistence/wager.repository';
 import * as api from '../support/api-client';
-import { freshTestDatabase } from '../support/test-database';
+import { freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
 import { freshTestQueues } from '../support/test-queues';
 
 // Consumer, outbox e worker de referências contra Postgres e LocalStack reais. Workers desligados no app:
@@ -324,4 +324,8 @@ describe('referência fora de ordem (§7.1)', () => {
     expect((await api.send(url, rollback)).body).toMatchObject({ status: 'REJECTED', failureCode: 'REFERENCE_NOT_FOUND' });
     expect(await balance(wallet.id)).toBe('100.00');
   });
+});
+
+test('invariante final: saldo == ledger em todas as wallets da suíte', async () => {
+  expect(await walletsDivergingFromLedger(orm)).toEqual([]);
 });
