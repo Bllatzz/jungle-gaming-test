@@ -49,10 +49,8 @@ export class OutboxPublisher {
             MessageAttributes: { eventType: { DataType: 'String', StringValue: m.eventType } },
           })),
         }), { abortSignal });
+        // só as recusadas voltam: as aceitas já estão na fila, marcá-las de novo só geraria duplicata
         failed = new Set((result.Failed ?? []).map((f) => f.Id!));
-        // depois de uma falha, os eventos seguintes da mesma wallet no lote também esperam (não passam na frente)
-        const failedWallets = new Set(messages.filter((m) => failed.has(m.id)).map((m) => m.aggregateId));
-        for (const m of messages) if (failedWallets.has(m.aggregateId)) failed.add(m.id);
       } catch (error) {
         // SQS fora: o lote inteiro entra no backoff em vez de ser tentado em loop
         this.logger.warn({ msg: 'outbox publish failed', error: (error as Error).message, count: messages.length });

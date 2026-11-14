@@ -147,8 +147,11 @@ export class WagerConsumer {
     await this.sqs.client.send(new ChangeMessageVisibilityCommand({ QueueUrl, ReceiptHandle: message.ReceiptHandle, VisibilityTimeout: seconds }));
   }
 
+  /** Falha ao devolver uma não trava as outras: a que falhou volta sozinha quando a visibilidade vencer. */
   private async release(QueueUrl: string, messages: Message[]): Promise<void> {
-    await Promise.all(messages.map((m) => this.setVisibility(QueueUrl, m, 0)));
+    const results = await Promise.allSettled(messages.map((m) => this.setVisibility(QueueUrl, m, 0)));
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    if (failed > 0) this.logger.warn({ msg: 'message release failed', count: failed });
   }
 }
 
