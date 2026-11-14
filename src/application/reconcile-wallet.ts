@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Money } from '../domain/money';
+import { Metrics } from '../infrastructure/observability/metrics';
 import { WagerQueries } from '../infrastructure/persistence/wager.queries';
 import { NotFoundError } from './errors';
 
@@ -17,7 +18,10 @@ export interface ReconciliationResult {
 export class ReconcileWallet {
   private readonly logger = new Logger(ReconcileWallet.name);
 
-  constructor(private readonly queries: WagerQueries) {}
+  constructor(
+    private readonly queries: WagerQueries,
+    private readonly metrics: Metrics,
+  ) {}
 
   async execute(walletId: string): Promise<ReconciliationResult> {
     const snapshot = await this.queries.reconciliationSnapshot(walletId);
@@ -29,7 +33,7 @@ export class ReconcileWallet {
     const difference = wallet.balance.subtract(calculatedBalance);
     const consistent = difference.isZero();
     if (!consistent) {
-      // métrica de divergência entra na parte 6
+      this.metrics.inc('reconciliation_divergences_total');
       this.logger.error({ msg: 'wallet balance diverges from ledger', walletId, difference: difference.toString() });
     }
     return { walletId, storedBalance: wallet.balance, calculatedBalance, difference, consistent, checkedEntries: entries };

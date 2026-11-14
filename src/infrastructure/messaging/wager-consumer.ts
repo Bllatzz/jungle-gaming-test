@@ -7,6 +7,7 @@ import { ProcessWagerTransaction, type WagerCommand, type WagerResult } from '..
 import { ENV, type Env } from '../../config/env';
 import { InvalidMoneyError, InvalidTransactionError } from '../../domain/errors';
 import { InvalidRequestError, parseWagerCommand, text } from '../http/request-parsing';
+import { Metrics } from '../observability/metrics';
 import { isTransient } from '../persistence/transient-errors';
 import { SqsGateway } from './sqs.gateway';
 
@@ -38,6 +39,7 @@ export class WagerConsumer {
     private readonly processWager: ProcessWagerTransaction,
     private readonly sqs: SqsGateway,
     @Inject(ENV) private readonly env: Env,
+    private readonly metrics: Metrics,
   ) {}
 
   /** Uma volta: recebe um lote e processa em ordem. Devolve quantas mensagens recebeu. */
@@ -86,10 +88,12 @@ export class WagerConsumer {
 
   private async handle(QueueUrl: string, message: Message): Promise<Outcome> {
     const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? 1);
-    const log = { sqsMessageId: message.MessageId, receiveCount };
+    // log ganha os ids da transação assim que o envelope é lido (retry e DLQ rastreáveis até a wallet)
+    const log: Record<string, unknown> = { sqsMessageId: message.MessageId, receiveCount };
     let processed: { messageId: string; result: WagerResult };
     try {
       const { messageId, command } = parseEnvelope(message.Body);
+      Object.assign(log, { messageId, correlationId: messageId, walletId: command.walletId, providerId: command.providerId });
       const result = await this.processWager.execute(
         command,
         { correlationId: messageId, causationId: messageId },
@@ -101,24 +105,26 @@ export class WagerConsumer {
       if (permanent || receiveCount >= MAX_RECEIVES) {
         const code = permanent ?? (isTransient(error) ? 'RETRIES_EXHAUSTED' : 'PROCESSING_FAILED');
         await this.deadLetter(QueueUrl, message, code);
+        this.metrics.inc('sqs_dead_lettered_total', { error_code: code });
         this.logger.warn({ msg: 'message dead-lettered', ...log, errorCode: code, error: (error as Error).message });
         return 'dead-lettered';
       }
       // transitório (ou bug): volta depois de 1s, 2s, 4s… — o SQS conta os recebimentos
       const delay = Math.min(2 ** (receiveCount - 1), MAX_BACKOFF_SECONDS);
       await this.setVisibility(QueueUrl, message, delay);
+      this.metrics.inc('wager_retries_total', { component: 'sqs_consumer' });
       this.logger.warn({ msg: 'message retry scheduled', ...log, delaySeconds: delay, transient: isTransient(error), error: (error as Error).message });
       return 'retry';
     }
 
     // ack só depois do commit. Se falhar (ou o processo morrer aqui), a redelivery cai no inbox/replay:
     // nunca é tratado como falha de processamento — a mensagem já está aplicada.
-    const { messageId, result } = processed;
+    const { result } = processed;
     await this.delete(QueueUrl, message).catch(async (error: unknown) => {
-      this.logger.warn({ msg: 'ack failed after commit', ...log, messageId, error: (error as Error).message });
+      this.logger.warn({ msg: 'ack failed after commit', ...log, error: (error as Error).message });
       await this.setVisibility(QueueUrl, message, 0).catch(() => undefined); // volta já e cai no replay
     });
-    this.logger.log({ msg: 'message processed', ...log, messageId, transactionId: result.transactionId, status: result.status, replay: result.idempotentReplay });
+    this.logger.log({ msg: 'message processed', ...log, transactionId: result.transactionId, status: result.status, replay: result.idempotentReplay });
     return 'acked';
   }
 

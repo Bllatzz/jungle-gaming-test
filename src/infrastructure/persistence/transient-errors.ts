@@ -13,6 +13,12 @@ const TRANSIENT_SQLSTATES = new Set([
 ]);
 const TRANSIENT_NETWORK = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE']);
 
+/** Conflito de lock (para a métrica): estourou o lock_timeout esperando a wallet, ou deadlock. */
+export function lockConflict(error: unknown): 'lock_timeout' | 'deadlock' | undefined {
+  if (error instanceof DeadlockException) return 'deadlock';
+  return (error as { code?: unknown } | undefined)?.code === '55P03' ? 'lock_timeout' : undefined;
+}
+
 export function isTransient(error: unknown): boolean {
   if (error instanceof DeadlockException) return true;
   if (!(error instanceof Error)) return false;

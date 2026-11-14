@@ -2,6 +2,7 @@ import { SendMessageBatchCommand } from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/core';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ENV, type Env } from '../../config/env';
+import { Metrics } from '../observability/metrics';
 import { WagerRepository } from '../persistence/wager.repository';
 import { SqsGateway } from './sqs.gateway';
 
@@ -23,15 +24,16 @@ export class OutboxPublisher {
     private readonly orm: MikroORM,
     private readonly sqs: SqsGateway,
     @Inject(ENV) private readonly env: Env,
+    private readonly metrics: Metrics,
   ) {}
 
   /** Uma volta. Devolve quantos eventos publicou. */
   async publishPending(): Promise<number> {
-    return this.orm.em.fork().transactional(async (em) => {
+    const { published, retried } = await this.orm.em.fork().transactional(async (em) => {
       const repo = new WagerRepository(em);
       const now = new Date();
       const messages = await repo.claimDueOutbox(now, BATCH);
-      if (messages.length === 0) return 0;
+      if (messages.length === 0) return { published: 0, retried: 0 };
 
       let failed: Set<string>;
       try {
@@ -59,7 +61,9 @@ export class OutboxPublisher {
 
       for (const m of messages) failed.has(m.id) ? m.scheduleRetry(now) : m.markPublished(now);
       await repo.saveOutbox(messages);
-      return messages.length - failed.size;
+      return { published: messages.length - failed.size, retried: failed.size };
     });
+    if (retried > 0) this.metrics.inc('wager_retries_total', { component: 'outbox' }, retried); // só depois do commit
+    return published;
   }
 }

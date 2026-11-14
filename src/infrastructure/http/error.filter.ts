@@ -1,8 +1,9 @@
 import { isTransient } from '../persistence/transient-errors';
 import { type ArgumentsHost, Catch, type ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import { ConflictError, NotFoundError } from '../../application/errors';
 import { InvalidMoneyError, InvalidTransactionError } from '../../domain/errors';
+import { requestContext } from './request-context';
 import { InvalidRequestError } from './request-parsing';
 
 /**
@@ -16,6 +17,8 @@ export class ErrorFilter implements ExceptionFilter {
 
   catch(error: unknown, host: ArgumentsHost): void {
     const res = host.switchToHttp().getResponse<Response>();
+    const req = host.switchToHttp().getRequest<Request>();
+    const where = { method: req.method, path: req.path, correlationId: requestContext(req).correlationId };
     const send = (status: number, code: string, message: string) => res.status(status).json({ error: code, message });
 
     if (error instanceof HttpException) {
@@ -31,11 +34,11 @@ export class ErrorFilter implements ExceptionFilter {
     } else if (error instanceof ConflictError) {
       send(HttpStatus.CONFLICT, error.code, error.message);
     } else if (isTransient(error)) {
-      this.logger.warn({ msg: 'transient failure', error: (error as Error).message });
+      this.logger.warn({ msg: 'transient failure', ...where, error: (error as Error).message });
       res.setHeader('Retry-After', '1');
       send(HttpStatus.SERVICE_UNAVAILABLE, 'TEMPORARILY_UNAVAILABLE', 'Falha transitória, tente de novo');
     } else {
-      this.logger.error({ msg: 'unexpected error', error: error instanceof Error ? error.stack : String(error) });
+      this.logger.error({ msg: 'unexpected error', ...where, error: error instanceof Error ? error.message : String(error), stack: (error as Error)?.stack });
       send(HttpStatus.INTERNAL_SERVER_ERROR, 'INTERNAL_ERROR', 'Erro interno');
     }
   }

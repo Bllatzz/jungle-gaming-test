@@ -2,8 +2,10 @@ import { MikroORM } from '@mikro-orm/core';
 import { Injectable, Logger } from '@nestjs/common';
 import { FailureCode } from '../domain/failure-codes';
 import { applyWager, type WagerDecision } from '../domain/wager-rules';
-import { WagerTransactionStatus } from '../domain/wager-transaction';
+import { type WagerTransaction, WagerTransactionStatus } from '../domain/wager-transaction';
+import { Metrics } from '../infrastructure/observability/metrics';
 import { toWagerTransaction } from '../infrastructure/persistence/mappers';
+import { lockConflict } from '../infrastructure/persistence/transient-errors';
 import { WagerRepository } from '../infrastructure/persistence/wager.repository';
 import { recordDecision } from './wager-outcome';
 
@@ -17,6 +19,8 @@ const BATCH = 20;
 /** Linha que deu erro (não regra de negócio) volta só depois disso: não trava as outras nem gira em loop. */
 const ERROR_DELAY_MS = 60_000;
 
+type Outcome = { transaction: WagerTransaction; attempts: number; stillPending: boolean };
+
 export function nextReferenceAttemptAt(attempts: number, now: Date): Date {
   return new Date(now.getTime() + Math.min(1_000 * 2 ** (attempts - 1), MAX_DELAY_MS));
 }
@@ -29,33 +33,52 @@ export function nextReferenceAttemptAt(attempts: number, now: Date): Date {
 export class ResolvePendingReferences {
   private readonly logger = new Logger(ResolvePendingReferences.name);
 
-  constructor(private readonly orm: MikroORM) {}
+  constructor(
+    private readonly orm: MikroORM,
+    private readonly metrics: Metrics,
+  ) {}
 
   /** Uma volta. Devolve quantas transações reavaliou (0 = nada a fazer: o loop descansa). */
   async runOnce(): Promise<number> {
     const due = await new WagerRepository(this.orm.em.fork()).duePendingReferences(new Date(), BATCH);
     let evaluated = 0;
     for (const { id, walletId } of due) {
+      let outcome: Outcome | undefined;
       try {
-        if (await this.orm.em.fork().transactional((em) => this.resolve(new WagerRepository(em), id, walletId))) evaluated++;
+        outcome = await this.orm.em.fork().transactional((em) => this.resolve(new WagerRepository(em), id, walletId));
       } catch (error) {
         // erro de infraestrutura ou bug: adia a linha (sem gastar tentativa) para não travar as outras
-        this.logger.error({ msg: 'pending reference retry failed', transactionId: id, error: (error as Error).message });
+        this.logger.error({ msg: 'pending reference retry failed', transactionId: id, walletId, error: (error as Error).message });
+        const conflict = lockConflict(error);
+        if (conflict) this.metrics.inc('wager_lock_conflicts_total', { type: conflict });
         await new WagerRepository(this.orm.em.fork())
           .postponePendingReference(id, new Date(Date.now() + ERROR_DELAY_MS))
           .catch(() => undefined); // banco fora: a próxima volta tenta de novo
+        continue;
+      }
+      if (!outcome) continue;
+      evaluated++;
+      // só depois do commit: métrica e log nunca contam trabalho desfeito
+      const { transaction, attempts, stillPending } = outcome;
+      const log = { transactionId: transaction.id, walletId, providerId: transaction.providerId, attempts };
+      if (stillPending) {
+        this.metrics.inc('wager_retries_total', { component: 'pending_reference' });
+        this.logger.log({ msg: 'pending reference still missing', ...log });
+      } else {
+        this.metrics.inc('wager_transactions_total', { source: 'pending_worker', status: transaction.status });
+        this.logger.log({ msg: 'pending reference resolved', ...log, status: transaction.status, failureCode: transaction.failureCode });
       }
     }
     return evaluated;
   }
 
-  /** false: outra instância já resolveu ou adiou esta linha. */
-  private async resolve(repo: WagerRepository, id: string, walletId: string): Promise<boolean> {
+  /** undefined: outra instância já resolveu ou adiou esta linha. */
+  private async resolve(repo: WagerRepository, id: string, walletId: string): Promise<Outcome | undefined> {
     const wallet = await repo.lockWallet(walletId);
     const row = await repo.findTransaction(id); // relida sob o lock: outra instância pode ter resolvido
     const now = new Date();
-    if (!wallet || !row || row.status !== WagerTransactionStatus.PendingReference) return false;
-    if (row.nextReferenceAttemptAt && row.nextReferenceAttemptAt > now) return false;
+    if (!wallet || !row || row.status !== WagerTransactionStatus.PendingReference) return undefined;
+    if (row.nextReferenceAttemptAt && row.nextReferenceAttemptAt > now) return undefined;
 
     const transaction = toWagerTransaction(row);
     const reference = await repo.findByExternalId(transaction.providerId, transaction.referenceExternalTransactionId!);
@@ -83,6 +106,6 @@ export class ResolvePendingReferences {
     });
     // ainda pendente: o evento PendingReference já saiu na primeira vez
     if (!stillPending) await recordDecision(repo, transaction, wallet, decision, { correlationId: transaction.id }, now);
-    return true;
+    return { transaction, attempts, stillPending };
   }
 }

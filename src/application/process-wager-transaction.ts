@@ -1,5 +1,5 @@
 import { MikroORM, UniqueConstraintViolationException } from '@mikro-orm/core';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import type { FailureCode } from '../domain/failure-codes';
 import { InboxMessage } from '../domain/inbox-message';
 import { Money } from '../domain/money';
@@ -7,6 +7,8 @@ import { applyWager } from '../domain/wager-rules';
 import { WagerTransaction, type WagerTransactionStatus } from '../domain/wager-transaction';
 import type { Wallet } from '../domain/wallet';
 import type { WagerTransactionRow } from '../infrastructure/persistence/entities';
+import { Metrics } from '../infrastructure/observability/metrics';
+import { lockConflict } from '../infrastructure/persistence/transient-errors';
 import { WagerRepository } from '../infrastructure/persistence/wager.repository';
 import { ConflictError, NotFoundError, violatedConstraint } from './errors';
 import type { RequestContext } from './event-context';
@@ -48,9 +50,53 @@ const MAX_ATTEMPTS = 3;
  */
 @Injectable()
 export class ProcessWagerTransaction {
-  constructor(private readonly orm: MikroORM) {}
+  private readonly logger = new Logger(ProcessWagerTransaction.name);
+
+  constructor(
+    private readonly orm: MikroORM,
+    private readonly metrics: Metrics,
+  ) {}
 
   async execute(command: WagerCommand, request: RequestContext, inbox?: InboxEntry): Promise<WagerResult> {
+    const source = inbox ? 'sqs' : 'http';
+    const started = performance.now();
+    try {
+      const result = await this.run(command, request, inbox);
+      this.observe(source, command, request, result, started);
+      return result;
+    } catch (error) {
+      if (error instanceof ConflictError) this.metrics.inc('wager_conflicts_total', { code: error.code });
+      const conflict = lockConflict(error);
+      if (conflict) this.metrics.inc('wager_lock_conflicts_total', { type: conflict });
+      this.logger.warn({
+        msg: 'wager transaction failed', correlationId: request.correlationId, messageId: request.causationId,
+        walletId: command.walletId, providerId: command.providerId, kind: command.kind,
+        error: (error as { code?: string }).code ?? (error as Error).name,
+      });
+      throw error;
+    } finally {
+      this.metrics.observe('wager_processing_duration_seconds', { source }, (performance.now() - started) / 1000);
+    }
+  }
+
+  /** Métrica e log do desfecho. Já commitado: uma falha aqui não pode virar erro para quem chamou. */
+  private observe(source: string, command: WagerCommand, request: RequestContext, result: WagerResult, started: number): void {
+    try {
+      this.metrics.inc(result.idempotentReplay ? 'wager_duplicates_total' : 'wager_transactions_total',
+        result.idempotentReplay ? { source } : { source, status: result.status });
+      // sem valores nem saldos no log (§12): só o que identifica e o desfecho
+      this.logger.log({
+        msg: 'wager transaction decided', correlationId: request.correlationId, messageId: request.causationId,
+        transactionId: result.transactionId, walletId: command.walletId, providerId: command.providerId, kind: command.kind,
+        status: result.status, failureCode: result.failureCode, replay: result.idempotentReplay,
+        durationMs: Math.round(performance.now() - started),
+      });
+    } catch {
+      // observabilidade nunca derruba o fluxo financeiro
+    }
+  }
+
+  private async run(command: WagerCommand, request: RequestContext, inbox: InboxEntry | undefined): Promise<WagerResult> {
     const payloadHash = wagerPayloadHash(command);
     newTransaction(command, payloadHash, new Date()); // valida o payload antes de pegar qualquer lock
     for (let attempt = 1; ; attempt++) {
@@ -60,6 +106,7 @@ export class ProcessWagerTransaction {
         const idempotencyRace =
           error instanceof UniqueConstraintViolationException && IDEMPOTENCY_CONSTRAINTS.has(violatedConstraint(error) ?? '');
         if (!idempotencyRace) throw error;
+        this.metrics.inc('wager_lock_conflicts_total', { type: 'idempotency_race' });
         // não deveria acontecer: a cada passada a transação concorrente já está commitada
         if (attempt >= MAX_ATTEMPTS) throw new ConflictError('IDEMPOTENCY_CONFLICT', 'Transação concorrente com a mesma idempotency key');
       }
