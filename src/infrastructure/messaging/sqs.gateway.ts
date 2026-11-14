@@ -13,6 +13,8 @@ export class SqsGateway implements OnApplicationShutdown {
       region: env.awsRegion,
       endpoint: env.awsEndpointUrl,
       credentials: { accessKeyId: env.awsAccessKeyId, secretAccessKey: env.awsSecretAccessKey },
+      // sem isso uma conexão pendurada trava o consumer (e o SIGTERM) para sempre; 30s > long poll de até 20s
+      requestHandler: { connectionTimeout: 2_000, requestTimeout: 30_000 },
     });
   }
 
