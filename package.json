@@ -13,7 +13,8 @@
     "migration:down": "bun run src/infrastructure/persistence/migrate.ts down",
     "test": "bun test test/unit",
     "test:integration": "bun test test/integration",
-    "test:concurrency": "bun test test/concurrency"
+    "test:concurrency": "bun test test/concurrency",
+    "test:load": "bun run test/load/run.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1169.0",
