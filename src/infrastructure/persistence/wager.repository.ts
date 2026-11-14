@@ -1,4 +1,5 @@
 import { type EntityManager, LockMode } from '@mikro-orm/core';
+import type { PendingReference, WagerStore } from '../../application/ports';
 import type { InboxMessage } from '../../domain/inbox-message';
 import type { WalletLedgerEntry } from '../../domain/ledger-entry';
 import type { Money } from '../../domain/money';
@@ -19,7 +20,7 @@ const LOCK_TIMEOUT = '5s';
  * tudo que for gravado aqui é commitado junto, ou nada. Inserts em ordem explícita porque as linhas
  * não declaram relações (o Unit of Work não saberia ordenar pelas FKs).
  */
-export class WagerRepository {
+export class WagerRepository implements WagerStore {
   constructor(private readonly em: EntityManager) {}
 
   /** SELECT … FOR UPDATE: a partir daqui, nenhuma outra transação mexe nessa wallet até o commit. */
@@ -100,15 +101,22 @@ export class WagerRepository {
     }
   }
 
-  /** PENDING_REFERENCE com a próxima tentativa vencida (null = ainda não tentada pelo worker). */
-  async duePendingReferences(now: Date, limit: number): Promise<{ id: string; walletId: string }[]> {
-    return this.em.find(
-      WagerTransactionEntity,
-      {
-        status: WagerTransactionStatus.PendingReference,
-        $or: [{ nextReferenceAttemptAt: null }, { nextReferenceAttemptAt: { $lte: now } }],
-      },
-      { fields: ['id', 'walletId'], orderBy: { nextReferenceAttemptAt: 'asc nulls first', id: 'asc' }, limit },
+  /**
+   * Reserva as PENDING_REFERENCE vencidas (null = ainda não tentada) empurrando a próxima tentativa para `until`.
+   * SKIP LOCKED: duas instâncias reservando ao mesmo tempo pegam linhas diferentes, e a reservada só volta a
+   * vencer em `until` (instância que morreu no meio solta a linha sozinha). NO KEY UPDATE não briga com a FK
+   * de quem referencia a linha.
+   */
+  async claimDuePendingReferences(now: Date, until: Date, limit: number): Promise<{ id: string; walletId: string }[]> {
+    return this.em.getConnection().execute<{ id: string; walletId: string }[]>(
+      `update wager_transactions set next_reference_attempt_at = ?
+        where id in (select id from wager_transactions
+                      where status = 'PENDING_REFERENCE'
+                        and (next_reference_attempt_at is null or next_reference_attempt_at <= ?)
+                      order by next_reference_attempt_at nulls first, id
+                      limit ? for no key update skip locked)
+        returning id, wallet_id as "walletId"`,
+      [until, now, limit], 'all', this.em.getTransactionContext(),
     );
   }
 
@@ -118,8 +126,11 @@ export class WagerRepository {
     );
   }
 
-  async findTransaction(id: string): Promise<WagerTransactionRow | undefined> {
-    return (await this.em.findOne(WagerTransactionEntity, { id })) ?? undefined;
+  async findPendingReference(id: string): Promise<PendingReference | undefined> {
+    const row = await this.em.findOne(WagerTransactionEntity, { id, status: WagerTransactionStatus.PendingReference });
+    return row
+      ? { transaction: map.toWagerTransaction(row), attempts: row.referenceAttempts, nextAttemptAt: row.nextReferenceAttemptAt ?? null }
+      : undefined;
   }
 
   /** Grava o novo estado de uma PENDING_REFERENCE reavaliada (o trigger recusa se ela já for terminal). */

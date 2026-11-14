@@ -22,3 +22,25 @@ test('src/domain não importa @nestjs, @mikro-orm nem @aws-sdk', async () => {
   }
   expect(offenders).toEqual([]);
 });
+
+// A aplicação fala com o mundo de fora pelas portas (src/application/ports.ts): nada de infraestrutura nem ORM.
+// @nestjs fica liberado (só @Injectable/Logger).
+const FORBIDDEN_IN_APPLICATION = /(from|import|require)\s*\(?\s*['"](@(mikro-orm|aws-sdk)(\/|['"])|[./]*\/infrastructure\/)/;
+
+test('a regex da aplicação pega import de infraestrutura e de ORM', () => {
+  for (const line of [`import { X } from '../infrastructure/persistence/wager.repository'`, `import type { Y } from '../../infrastructure/x'`, `import { MikroORM } from '@mikro-orm/core'`]) {
+    expect(FORBIDDEN_IN_APPLICATION.test(line)).toBe(true);
+  }
+  expect(FORBIDDEN_IN_APPLICATION.test(`import { Injectable } from '@nestjs/common'`)).toBe(false);
+});
+
+test('src/application não importa src/infrastructure, @mikro-orm nem @aws-sdk', async () => {
+  const root = join(import.meta.dir, '../../..');
+  const files = await Array.fromAsync(new Glob('src/application/**/*.ts').scan(root));
+  expect(files.length).toBeGreaterThan(0);
+  const offenders = [];
+  for (const file of files) {
+    if (FORBIDDEN_IN_APPLICATION.test(await Bun.file(join(root, file)).text())) offenders.push(file);
+  }
+  expect(offenders).toEqual([]);
+});

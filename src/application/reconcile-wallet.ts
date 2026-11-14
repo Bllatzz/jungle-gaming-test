@@ -1,8 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Money } from '../domain/money';
-import { Metrics } from '../infrastructure/observability/metrics';
-import { WagerQueries } from '../infrastructure/persistence/wager.queries';
 import { NotFoundError } from './errors';
+import { MetricsRecorder, ReconciliationSource } from './ports';
 
 export interface ReconciliationResult {
   walletId: string;
@@ -19,8 +18,8 @@ export class ReconcileWallet {
   private readonly logger = new Logger(ReconcileWallet.name);
 
   constructor(
-    private readonly queries: WagerQueries,
-    private readonly metrics: Metrics,
+    private readonly queries: ReconciliationSource,
+    private readonly metrics: MetricsRecorder,
   ) {}
 
   async execute(walletId: string): Promise<ReconciliationResult> {

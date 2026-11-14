@@ -1,7 +1,8 @@
 import { Injectable } from '@nestjs/common';
+import { type CounterName, type HistogramName, MetricsRecorder } from '../../application/ports';
 
 /** Métricas do §12 (e a divergência do §9). Nome → ajuda; o tipo vem da lista em que está. */
-const COUNTERS = {
+const COUNTERS: Record<CounterName, string> = {
   wager_transactions_total: 'Transações decididas, por origem e status',
   wager_duplicates_total: 'Duplicatas detectadas (replay idempotente, inclusive redelivery SQS)',
   wager_conflicts_total: 'Pedidos recusados por conflito de idempotência ou de messageId',
@@ -9,14 +10,13 @@ const COUNTERS = {
   wager_retries_total: 'Novas tentativas agendadas, por componente',
   sqs_dead_lettered_total: 'Mensagens enviadas para a DLQ por esta instância, por motivo',
   reconciliation_divergences_total: 'Reconciliações em que o saldo gravado diverge do ledger',
-} as const;
-const HISTOGRAMS = {
+};
+const HISTOGRAMS: Record<HistogramName, string> = {
   wager_processing_duration_seconds: 'Latência do processamento de uma transação (inclui replay)',
-} as const;
+};
 const BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
 
-export type CounterName = keyof typeof COUNTERS;
-export type HistogramName = keyof typeof HISTOGRAMS;
+export type { CounterName, HistogramName };
 type Labels = Record<string, string>;
 type Histogram = { buckets: number[]; sum: number; count: number };
 
@@ -25,7 +25,7 @@ type Histogram = { buckets: number[]; sum: number; count: number };
  * shortcut: sem prom-client (são ~60 linhas); trocar por ele se precisar de summaries/métricas de processo.
  */
 @Injectable()
-export class Metrics {
+export class Metrics implements MetricsRecorder {
   private readonly counters = new Map<CounterName, Map<string, number>>();
   private readonly histograms = new Map<HistogramName, Map<string, Histogram>>();
 

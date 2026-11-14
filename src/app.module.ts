@@ -16,6 +16,8 @@ import { ResolvePendingReferences } from './application/resolve-pending-referenc
 import { OutboxPublisher } from './infrastructure/messaging/outbox-publisher';
 import { WagerConsumer } from './infrastructure/messaging/wager-consumer';
 import { Workers } from './infrastructure/workers/workers';
+import { MetricsRecorder, ReconciliationSource, UnitOfWork } from './application/ports';
+import { MikroUnitOfWork } from './infrastructure/persistence/unit-of-work';
 
 @Module({})
 export class AppModule {
@@ -30,6 +32,10 @@ export class AppModule {
         SqsGateway,
         Metrics,
         WagerQueries,
+        // portas da aplicação → adaptadores da infraestrutura
+        { provide: UnitOfWork, useClass: MikroUnitOfWork },
+        { provide: MetricsRecorder, useExisting: Metrics },
+        { provide: ReconciliationSource, useExisting: WagerQueries },
         ProcessWagerTransaction,
         OpenWallet,
         ReconcileWallet,

@@ -346,6 +346,34 @@ describe('referência fora de ordem (§7.1)', () => {
     expect(await balance(wallet.id)).toBe('100.00');
   });
 
+  test('instâncias concorrentes reservam lotes disjuntos (SKIP LOCKED) e a reserva segura a linha depois do commit', async () => {
+    const wallet = await api.openWallet(url, '100.00');
+    const ids: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const refund = api.wagerPayload(wallet, 'REFUND', '1.00', { referenceExternalTransactionId: `falta-${randomUUID()}` });
+      expect((await api.send(url, refund)).status).toBe(202);
+      ids.push((await transactionOf(refund)).id);
+    }
+    const now = new Date();
+    const until = new Date(now.getTime() + 60_000);
+    const mine = (rows: { id: string }[]) => rows.map((r) => r.id).filter((id) => ids.includes(id));
+
+    let second: string[] = [];
+    const first = await orm.em.fork().transactional(async (em) => {
+      const claimed = mine(await new WagerRepository(em).claimDuePendingReferences(now, until, 1_000));
+      // outra "instância" reserva enquanto a primeira ainda não commitou: pula as linhas travadas
+      second = mine(await new WagerRepository(orm.em.fork()).claimDuePendingReferences(now, until, 1_000));
+      return claimed;
+    });
+    expect(first.sort()).toEqual([...ids].sort());
+    expect(second).toEqual([]);
+    // já commitada: a reserva empurrou a próxima tentativa, ninguém pega de novo antes de `until`
+    expect(mine(await new WagerRepository(orm.em.fork()).claimDuePendingReferences(new Date(), until, 1_000))).toEqual([]);
+    for (const id of ids) {
+      expect(await db().findOneOrFail(WagerTransactionEntity, { id })).toMatchObject({ referenceAttempts: 0, nextReferenceAttemptAt: until });
+    }
+  });
+
   test('replay de uma transação ainda pendente devolve o saldo da primeira resposta, mesmo depois de o worker tentar', async () => {
     const wallet = await api.openWallet(url, '100.00');
     const refund = api.wagerPayload(wallet, 'REFUND', '5.00', { referenceExternalTransactionId: 'ainda-nao-chegou' });

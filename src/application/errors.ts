@@ -9,8 +9,12 @@ export class NotFoundError extends Error {
   }
 }
 
-/** Nome da constraint única que estourou (o driver pg copia o campo para a exceção do MikroORM). */
-export const violatedConstraint = (error: unknown): string | undefined => (error as { constraint?: string }).constraint;
+/** Violação de UNIQUE no banco (traduzida pelo UnitOfWork), com o nome da constraint que estourou. */
+export class UniqueViolationError extends Error {
+  constructor(readonly constraint: string | undefined, options?: { cause: unknown }) {
+    super(`Violação de unicidade: ${constraint ?? 'desconhecida'}`, options);
+  }
+}
 
 export class ConflictError extends Error {
   constructor(readonly code: 'IDEMPOTENCY_CONFLICT' | 'WALLET_ALREADY_EXISTS' | 'MESSAGE_ID_CONFLICT', message: string) {

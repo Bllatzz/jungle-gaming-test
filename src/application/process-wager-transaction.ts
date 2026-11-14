@@ -1,4 +1,3 @@
-import { MikroORM, UniqueConstraintViolationException } from '@mikro-orm/core';
 import { Injectable, Logger } from '@nestjs/common';
 import type { FailureCode } from '../domain/failure-codes';
 import { InboxMessage } from '../domain/inbox-message';
@@ -6,13 +5,10 @@ import { Money } from '../domain/money';
 import { applyWager } from '../domain/wager-rules';
 import { WagerTransaction, type WagerTransactionStatus } from '../domain/wager-transaction';
 import type { Wallet } from '../domain/wallet';
-import type { WagerTransactionRow } from '../infrastructure/persistence/entities';
-import { Metrics } from '../infrastructure/observability/metrics';
-import { lockConflict } from '../infrastructure/persistence/transient-errors';
-import { WagerRepository } from '../infrastructure/persistence/wager.repository';
-import { ConflictError, NotFoundError, violatedConstraint } from './errors';
+import { ConflictError, NotFoundError, UniqueViolationError } from './errors';
 import type { RequestContext } from './event-context';
 import { type WagerPayload, wagerPayloadHash } from './payload-hash';
+import { MetricsRecorder, type RecordedWager, UnitOfWork, type WagerStore } from './ports';
 import { recordDecision } from './wager-outcome';
 
 export interface WagerCommand extends WagerPayload {
@@ -53,8 +49,8 @@ export class ProcessWagerTransaction {
   private readonly logger = new Logger(ProcessWagerTransaction.name);
 
   constructor(
-    private readonly orm: MikroORM,
-    private readonly metrics: Metrics,
+    private readonly uow: UnitOfWork,
+    private readonly metrics: MetricsRecorder,
   ) {}
 
   async execute(command: WagerCommand, request: RequestContext, inbox?: InboxEntry): Promise<WagerResult> {
@@ -66,8 +62,6 @@ export class ProcessWagerTransaction {
       return result;
     } catch (error) {
       if (error instanceof ConflictError) this.metrics.inc('wager_conflicts_total', { code: error.code });
-      const conflict = lockConflict(error);
-      if (conflict) this.metrics.inc('wager_lock_conflicts_total', { type: conflict });
       this.logger.warn({
         msg: 'wager transaction failed', correlationId: request.correlationId, messageId: request.causationId,
         walletId: command.walletId, providerId: command.providerId, kind: command.kind,
@@ -101,10 +95,9 @@ export class ProcessWagerTransaction {
     newTransaction(command, payloadHash, new Date()); // valida o payload antes de pegar qualquer lock
     for (let attempt = 1; ; attempt++) {
       try {
-        return await this.orm.em.fork().transactional((em) => this.process(new WagerRepository(em), command, payloadHash, request, inbox));
+        return await this.uow.transaction((store) => this.process(store, command, payloadHash, request, inbox));
       } catch (error) {
-        const idempotencyRace =
-          error instanceof UniqueConstraintViolationException && IDEMPOTENCY_CONSTRAINTS.has(violatedConstraint(error) ?? '');
+        const idempotencyRace = error instanceof UniqueViolationError && IDEMPOTENCY_CONSTRAINTS.has(error.constraint ?? '');
         if (!idempotencyRace) throw error;
         this.metrics.inc('wager_lock_conflicts_total', { type: 'idempotency_race' });
         // não deveria acontecer: a cada passada a transação concorrente já está commitada
@@ -114,7 +107,7 @@ export class ProcessWagerTransaction {
   }
 
   private async process(
-    repo: WagerRepository, command: WagerCommand, payloadHash: string, request: RequestContext, inbox: InboxEntry | undefined,
+    repo: WagerStore, command: WagerCommand, payloadHash: string, request: RequestContext, inbox: InboxEntry | undefined,
   ): Promise<WagerResult> {
     // 1. Lock da wallet: serializa tudo desta wallet, em qualquer instância.
     const wallet = await repo.lockWallet(command.walletId);
@@ -189,7 +182,7 @@ function newTransaction(command: WagerCommand, payloadHash: string, now: Date): 
  * Mesma key + mesmo payload → o resultado gravado. Qualquer outra coincidência → conflito, não replay.
  * Devolve o estado atual da transação: uma PENDING_REFERENCE resolvida depois responde com o desfecho.
  */
-function replay(existing: WagerTransactionRow, idempotencyKey: string, payloadHash: string, wallet: Wallet): WagerResult {
+function replay(existing: RecordedWager, idempotencyKey: string, payloadHash: string, wallet: Wallet): WagerResult {
   if (existing.idempotencyKey !== idempotencyKey || existing.payloadHash !== payloadHash) {
     throw new ConflictError(
       'IDEMPOTENCY_CONFLICT',

@@ -1,12 +1,13 @@
 import { IsolationLevel, MikroORM } from '@mikro-orm/core';
 import { Injectable } from '@nestjs/common';
+import type { ReconciliationSource } from '../../application/ports';
 import type { Wallet } from '../../domain/wallet';
 import { LedgerEntryEntity, type LedgerEntryRow, WagerTransactionEntity, type WagerTransactionRow, WalletEntity } from './entities';
 import * as map from './mappers';
 
 /** Leituras para a API. Não passam pelo lock: só olham o que já foi commitado. */
 @Injectable()
-export class WagerQueries {
+export class WagerQueries implements ReconciliationSource {
   constructor(private readonly orm: MikroORM) {}
 
   /** Para as métricas: quantos eventos esperam publicação e a idade do mais antigo (outbox lag). */

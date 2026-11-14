@@ -13,6 +13,9 @@ const TRANSIENT_SQLSTATES = new Set([
 ]);
 const TRANSIENT_NETWORK = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE']);
 
+/** Nome da constraint única que estourou (o driver pg copia o campo para a exceção do MikroORM). */
+export const violatedConstraint = (error: unknown): string | undefined => (error as { constraint?: string }).constraint;
+
 /** Conflito de lock (para a métrica): estourou o lock_timeout esperando a wallet, ou deadlock. */
 export function lockConflict(error: unknown): 'lock_timeout' | 'deadlock' | undefined {
   if (error instanceof DeadlockException) return 'deadlock';

@@ -8,8 +8,8 @@ import { OutboxMessage } from '../domain/outbox-message';
 import type { WagerDecision } from '../domain/wager-rules';
 import type { WagerTransaction } from '../domain/wager-transaction';
 import type { Wallet } from '../domain/wallet';
-import type { WagerRepository } from '../infrastructure/persistence/wager.repository';
 import { eventContext, type RequestContext } from './event-context';
+import type { WagerStore } from './ports';
 
 /**
  * Grava o efeito de uma decisão já tomada: lançamento + saldo (se moveu dinheiro) e os eventos na outbox.
@@ -17,7 +17,7 @@ import { eventContext, type RequestContext } from './event-context';
  * de referências: o mesmo efeito, na mesma transação SQL de quem chama.
  */
 export async function recordDecision(
-  repo: WagerRepository, transaction: WagerTransaction, wallet: Wallet, decision: WagerDecision, request: RequestContext, now: Date,
+  repo: WagerStore, transaction: WagerTransaction, wallet: Wallet, decision: WagerDecision, request: RequestContext, now: Date,
 ): Promise<void> {
   if (decision.status === 'PROCESSED' && decision.ledgerEntry) {
     await repo.appendLedgerEntry(decision.ledgerEntry, wallet.version);

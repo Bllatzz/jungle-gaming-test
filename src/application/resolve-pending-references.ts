@@ -1,12 +1,8 @@
-import { MikroORM } from '@mikro-orm/core';
 import { Injectable, Logger } from '@nestjs/common';
 import { FailureCode } from '../domain/failure-codes';
 import { applyWager, type WagerDecision } from '../domain/wager-rules';
-import { type WagerTransaction, WagerTransactionStatus } from '../domain/wager-transaction';
-import { Metrics } from '../infrastructure/observability/metrics';
-import { toWagerTransaction } from '../infrastructure/persistence/mappers';
-import { lockConflict } from '../infrastructure/persistence/transient-errors';
-import { WagerRepository } from '../infrastructure/persistence/wager.repository';
+import type { WagerTransaction } from '../domain/wager-transaction';
+import { MetricsRecorder, UnitOfWork, type WagerStore } from './ports';
 import { recordDecision } from './wager-outcome';
 
 /**
@@ -18,6 +14,8 @@ const MAX_DELAY_MS = 60_000;
 const BATCH = 20;
 /** Linha que deu erro (não regra de negócio) volta só depois disso: não trava as outras nem gira em loop. */
 const ERROR_DELAY_MS = 60_000;
+/** Reserva de um lote: maior que o pior caso de 20 linhas esperando o lock da wallet (5 s cada). */
+const CLAIM_MS = 120_000;
 
 type Outcome = { transaction: WagerTransaction; attempts: number; stillPending: boolean };
 
@@ -27,32 +25,33 @@ export function nextReferenceAttemptAt(attempts: number, now: Date): Date {
 
 /**
  * Worker agendado das PENDING_REFERENCE: reavalia cada transação vencida com as mesmas regras (applyWager),
- * sob o lock da wallet. Várias instâncias podem rodar: quem chega depois relê a linha e vê que não é a vez.
+ * sob o lock da wallet. Várias instâncias podem rodar: cada volta reserva um lote com SKIP LOCKED, então
+ * as instâncias não varrem as mesmas linhas, e a linha relida sob o lock só é tratada se a reserva ainda for dela.
  */
 @Injectable()
 export class ResolvePendingReferences {
   private readonly logger = new Logger(ResolvePendingReferences.name);
 
   constructor(
-    private readonly orm: MikroORM,
-    private readonly metrics: Metrics,
+    private readonly uow: UnitOfWork,
+    private readonly metrics: MetricsRecorder,
   ) {}
 
   /** Uma volta. Devolve quantas transações reavaliou (0 = nada a fazer: o loop descansa). */
   async runOnce(): Promise<number> {
-    const due = await new WagerRepository(this.orm.em.fork()).duePendingReferences(new Date(), BATCH);
+    const now = new Date();
+    const claimedUntil = new Date(now.getTime() + CLAIM_MS);
+    const due = await this.uow.transaction((store) => store.claimDuePendingReferences(now, claimedUntil, BATCH));
     let evaluated = 0;
     for (const { id, walletId } of due) {
       let outcome: Outcome | undefined;
       try {
-        outcome = await this.orm.em.fork().transactional((em) => this.resolve(new WagerRepository(em), id, walletId));
+        outcome = await this.uow.transaction((store) => this.resolve(store, id, walletId, claimedUntil));
       } catch (error) {
         // erro de infraestrutura ou bug: adia a linha (sem gastar tentativa) para não travar as outras
         this.logger.error({ msg: 'pending reference retry failed', transactionId: id, walletId, error: (error as Error).message });
-        const conflict = lockConflict(error);
-        if (conflict) this.metrics.inc('wager_lock_conflicts_total', { type: conflict });
-        await new WagerRepository(this.orm.em.fork())
-          .postponePendingReference(id, new Date(Date.now() + ERROR_DELAY_MS))
+        await this.uow
+          .transaction((store) => store.postponePendingReference(id, new Date(Date.now() + ERROR_DELAY_MS)))
           .catch(() => undefined); // banco fora: a próxima volta tenta de novo
         continue;
       }
@@ -72,15 +71,14 @@ export class ResolvePendingReferences {
     return evaluated;
   }
 
-  /** undefined: outra instância já resolveu ou adiou esta linha. */
-  private async resolve(repo: WagerRepository, id: string, walletId: string): Promise<Outcome | undefined> {
+  /** undefined: a linha já foi resolvida, ou a reserva venceu e outra instância a pegou. */
+  private async resolve(repo: WagerStore, id: string, walletId: string, claimedUntil: Date): Promise<Outcome | undefined> {
     const wallet = await repo.lockWallet(walletId);
-    const row = await repo.findTransaction(id); // relida sob o lock: outra instância pode ter resolvido
+    const pending = await repo.findPendingReference(id); // relida sob o lock
     const now = new Date();
-    if (!wallet || !row || row.status !== WagerTransactionStatus.PendingReference) return undefined;
-    if (row.nextReferenceAttemptAt && row.nextReferenceAttemptAt > now) return undefined;
+    if (!wallet || !pending || pending.nextAttemptAt?.getTime() !== claimedUntil.getTime()) return undefined;
 
-    const transaction = toWagerTransaction(row);
+    const { transaction } = pending;
     const reference = await repo.findByExternalId(transaction.providerId, transaction.referenceExternalTransactionId!);
     let decision: WagerDecision = applyWager({
       wallet,
@@ -91,7 +89,7 @@ export class ResolvePendingReferences {
       now,
     });
 
-    const attempts = row.referenceAttempts + 1;
+    const attempts = pending.attempts + 1;
     if (decision.status === 'PENDING_REFERENCE' && attempts >= MAX_REFERENCE_ATTEMPTS) {
       // referência que existe mas nunca foi aplicada é outro diagnóstico que referência que nunca chegou
       const failureCode = reference ? FailureCode.ReferenceNotProcessed : FailureCode.ReferenceNotFound;
