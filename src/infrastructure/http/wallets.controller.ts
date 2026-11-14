@@ -1,10 +1,11 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query, Req } from '@nestjs/common';
+import { Body, Controller, UseGuards, Get, HttpCode, HttpStatus, Param, Post, Query, Req } from '@nestjs/common';
 import type { Request } from 'express';
 import { NotFoundError } from '../../application/errors';
 import { OpenWallet } from '../../application/open-wallet';
 import { ReconcileWallet } from '../../application/reconcile-wallet';
 import { WagerQueries } from '../persistence/wager.queries';
 import { ledgerEntryJson, reconciliationJson, walletJson } from './presenters';
+import { AuthGuard } from './auth.guard';
 import { requestContext } from './request-context';
 import { InvalidRequestError, parseOpenWallet, uuid } from './request-parsing';
 
@@ -12,6 +13,7 @@ const DEFAULT_PAGE = 50;
 const MAX_PAGE = 200;
 
 @Controller('wallets')
+@UseGuards(AuthGuard)
 export class WalletsController {
   constructor(
     private readonly openWallet: OpenWallet,

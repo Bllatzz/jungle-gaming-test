@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, HttpStatus, Param, Post, Req, Res } from '@nestjs/common';
+import { Body, Controller, UseGuards, Get, Headers, HttpStatus, Param, Post, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { NotFoundError } from '../../application/errors';
 import { ProcessWagerTransaction } from '../../application/process-wager-transaction';
@@ -6,6 +6,7 @@ import { WagerTransactionStatus } from '../../domain/wager-transaction';
 import type { WagerTransactionRow } from '../persistence/entities';
 import { WagerQueries } from '../persistence/wager.queries';
 import { transactionJson, wagerResultJson } from './presenters';
+import { AuthGuard } from './auth.guard';
 import { requestContext } from './request-context';
 import { parseWagerCommand, text, uuid } from './request-parsing';
 
@@ -17,6 +18,7 @@ const STATUS_BY_RESULT: Partial<Record<WagerTransactionStatus, HttpStatus>> = {
 };
 
 @Controller()
+@UseGuards(AuthGuard)
 export class WagerTransactionsController {
   constructor(
     private readonly processWager: ProcessWagerTransaction,
