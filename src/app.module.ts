@@ -10,6 +10,10 @@ import { WalletsController } from './infrastructure/http/wallets.controller';
 import { OpenWallet } from './application/open-wallet';
 import { ProcessWagerTransaction } from './application/process-wager-transaction';
 import { ReconcileWallet } from './application/reconcile-wallet';
+import { ResolvePendingReferences } from './application/resolve-pending-references';
+import { OutboxPublisher } from './infrastructure/messaging/outbox-publisher';
+import { WagerConsumer } from './infrastructure/messaging/wager-consumer';
+import { Workers } from './infrastructure/workers/workers';
 
 @Module({})
 export class AppModule {
@@ -26,6 +30,10 @@ export class AppModule {
         ProcessWagerTransaction,
         OpenWallet,
         ReconcileWallet,
+        ResolvePendingReferences,
+        WagerConsumer,
+        OutboxPublisher,
+        Workers,
       ],
     };
   }
