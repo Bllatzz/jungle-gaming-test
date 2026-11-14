@@ -30,6 +30,9 @@ curl localhost:3000/health/live    # {"status":"ok"}
 curl localhost:3000/health/ready   # {"status":"ok","checks":{"postgres":"up","sqs":"up"}}
 ```
 
+Observabilidade: logs em JSON no stdout e métricas Prometheus em `curl localhost:3000/metrics`
+(lista em [ARCHITECTURE.md](ARCHITECTURE.md#logs-e-métricas)).
+
 ## API
 
 ```bash

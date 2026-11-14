@@ -84,6 +84,46 @@ a própria política de retry/DLQ.
 - Trade-off aceito: com o SQS fora, a réplica sai do balanceamento inclusive para a API HTTP.
   É o que o desafio pede (readiness = Postgres **e** SQS alcançáveis).
 
+## Logs e métricas
+
+**Logs:** `JsonLogger` (o logger do Nest trocado por um de ~30 linhas): uma linha JSON por evento no
+stdout — `{ time, level, context, msg, ...campos }`. Os logs internos do Nest saem no mesmo formato.
+
+- Toda transação decidida (HTTP ou SQS, inclusive replay) gera `wager transaction decided` com
+  `correlationId`, `messageId` (na fila), `transactionId`, `walletId`, `providerId`, `kind`, `status`,
+  `failureCode`, `replay` e `durationMs`. O consumer loga `sqsMessageId`/`messageId`/`receiveCount`
+  em retry e DLQ; o worker de referências loga `transactionId`, `walletId`, `providerId`.
+- **Sem dados financeiros:** nada de valores, saldos ou payload no log. Exceção consciente: a
+  divergência de reconciliação loga a diferença — é o dado que o operador precisa.
+
+**Métricas:** `GET /metrics` em formato Prometheus, sem autenticação (como os health checks).
+
+| §12 pede | Métrica |
+|---|---|
+| Transações por status | `wager_transactions_total{source,status}` — source: `http`, `sqs`, `pending_worker` |
+| Duplicatas detectadas | `wager_duplicates_total{source}` (replay idempotente, inclusive redelivery da fila) e `wager_conflicts_total{code}` |
+| Retries | `wager_retries_total{component}` — `sqs_consumer`, `outbox`, `pending_reference` |
+| Mensagens em DLQ | `sqs_dead_lettered_total{error_code}` e `sqs_dlq_messages` (profundidade da DLQ) |
+| Conflitos de lock | `wager_lock_conflicts_total{type}` — `lock_timeout`, `deadlock`, `idempotency_race` |
+| Outbox lag | `outbox_lag_seconds` (idade do evento pendente mais antigo) e `outbox_pending_messages` |
+| Latência de processamento | `wager_processing_duration_seconds{source}` (histogram) |
+| Divergência de reconciliação (§9) | `reconciliation_divergences_total` |
+
+- Contadores e histogram são por instância (o Prometheus soma as réplicas). Os gauges vêm do banco e
+  do SQS na hora do scrape, então valem para o sistema todo.
+- `wager_transactions_total` conta **decisões**: uma REFUND que chega antes da BET conta
+  `PENDING_REFERENCE` na entrada e depois `PROCESSED` com `source="pending_worker"`.
+- Contagem e log só depois do commit (worker e publisher inclusive): nunca contam trabalho desfeito.
+  E uma falha de log/métrica depois do commit não vira erro para quem chamou.
+- Com banco ou SQS fora, o scrape devolve o que der (sem o gauge que falhou), nunca 500. Alerta de
+  "gauge sumiu" é com `absent()` no Prometheus. A query da outbox tem `statement_timeout` de 2 s:
+  scrape com banco lento não segura conexão do pool.
+- Falhas também logam com os ids (`wager transaction failed`, e o consumer em retry/DLQ com
+  `messageId`, `walletId`, `providerId`). O log de erro HTTP usa o mesmo `correlationId` do use case.
+- `/metrics` sem autenticação, como os health checks: em produção, exposto só na rede interna.
+- Registro próprio em vez de `prom-client`: são ~60 linhas para counter e histogram, sem dependência.
+  Trocar se precisar de métricas de processo (CPU, heap) ou summaries.
+
 ## Autenticação
 
 Não implementada (vale 0 pontos no desafio; prioridade foi correção financeira e concorrência).
