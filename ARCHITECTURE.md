@@ -9,10 +9,12 @@ Serviço NestJS que processa transações de apostas (BET, WIN, LOSS, REFUND, RO
 por HTTP e por SQS, mantendo saldo materializado e ledger imutável consistentes sob entrega
 at-least-once, mensagens fora de ordem e múltiplas instâncias.
 
-Camadas (dependências só apontam para dentro):
+Camadas:
 
-- `src/domain` — regras de negócio em TypeScript puro. Não importa Nest, ORM nem AWS SDK.
-- `src/application` — use cases e portas (interfaces).
+- `src/domain` — regras de negócio em TypeScript puro. Não importa Nest, ORM nem AWS SDK
+  (garantido por teste: `test/unit/domain/purity.test.ts`).
+- `src/application` — use cases. Usam o repositório e as métricas da infraestrutura direto, sem
+  portas (por quê: [Camadas](#camadas)).
 - `src/infrastructure` — HTTP, SQS, persistência (MikroORM), observabilidade.
 
 ## Topologia
@@ -22,8 +24,8 @@ e roda em N réplicas idênticas.
 
 - **Por quê:** uma imagem e uma config; "≥ 3 instâncias" são 3 processos iguais; todo worker
   precisa ser seguro sob concorrência desde o início.
-- **Coordenação pelo banco, não por processo líder** *(planejado — partes 4 e 5)*: `SELECT … FOR UPDATE`
-  por wallet e `FOR UPDATE SKIP LOCKED` nas filas de trabalho. O lock por wallet já foi provado no spike. Qualquer réplica pode morrer sem que nada pare.
+- **Coordenação pelo banco, não por processo líder:** `SELECT … FOR UPDATE` por wallet e
+  `FOR UPDATE SKIP LOCKED` na outbox. Qualquer réplica pode morrer sem que nada pare.
 - **Alternativas descartadas:** papéis por variável (`ROLE=api|worker`) — mais combinações para
   testar sem ganho no escopo do desafio; serviços separados — triplica setup em 48h.
 - **Trade-off:** API e workers não escalam de forma independente.
@@ -32,6 +34,13 @@ e roda em N réplicas idênticas.
 
 Versões no momento do spike (as exatas ficam no `bun.lock`): Bun 1.3.13, NestJS 12.5, MikroORM 7.2,
 TypeScript 7.0, PostgreSQL 16, LocalStack 4.12.
+
+**Por que MikroORM (e não TypeORM):** é o preferencial do desafio e tem o que este domínio usa:
+`em.transactional()` com fork por transação (nada vaza entre requisições concorrentes), `LockMode`
+para o `FOR UPDATE`, `EntitySchema`/`defineEntity` sem decorators (o domínio fica puro e as entidades
+de persistência são separadas) e tipo `decimal` mapeado como string (o `Money` nunca passa por
+`number`). O mapeamento do `Money` está em [Mapeamento](#mapeamento) e a estratégia transacional em
+[Processamento de uma transação](#processamento-de-uma-transação-srcapplication).
 
 Spike executado antes de qualquer código de negócio:
 
@@ -184,6 +193,8 @@ que falha decide:
      `REFERENCE_INVALID_KIND` na hora (esperar não resolveria);
    - referência de outro provider/player/wallet/moeda/rodada → `REFERENCE_MISMATCH`, mesmo que ela
      ainda esteja pendente;
+   - referência de tipo não permitido (ex.: REFUND de um WIN) → `REFERENCE_INVALID_KIND`, também
+     mesmo pendente (o tipo dela não muda esperando);
    - ausente ou ainda não aplicada → `PENDING_REFERENCE`;
    - senão precisa estar `PROCESSED`, ter tipo compatível (REFUND→BET; ROLLBACK→BET/WIN/REFUND;
      WIN e LOSS→BET), não ter sido revertida pelo mesmo tipo e ter o mesmo valor (REFUND/ROLLBACK).
@@ -580,7 +591,8 @@ ser pago. Não alterei: fica para alinhar com o time, junto com a regra 4.
   precisa descobrir o id por outro caminho (o desafio não pede busca de wallet por player).
 - A migration 2 preenche `wallet_version` e `observed_balance` das linhas antigas a partir do
   ledger; transações antigas sem lançamento (LOSS/REJECTED) ficam sem saldo observado, por isso a
-  regra entrou como `NOT VALID` (vale para linhas novas).
+  regra entrou como `NOT VALID` (vale para linhas novas). O replay de uma dessas linhas antigas
+  responde 500 em vez de inventar um saldo: num banco criado do zero (o caso da entrega) elas não existem.
 - Reconciliação soma créditos e débitos de toda a vida da wallet: acima de 10^18 de movimento
   acumulado a soma não cabe no `Money` (limite de `NUMERIC(20,2)`). Do mesmo jeito, um crédito que
   levaria o saldo a 10^18 sai como `INVALID_MONEY` (400 / DLQ), não como rejeição gravada.

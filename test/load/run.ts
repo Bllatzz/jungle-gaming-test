@@ -109,10 +109,11 @@ async function run() {
   // invariante (saldo == ledger) e, além dela, saldo == inicial ± o que as respostas disseram (pega débito duplicado ou perdido)
   const checks = await Promise.all([...wallets, hot].map(async (w) => {
     const rec = await reconcile(pick(urls), w.id).catch(() => undefined);
-    const expected = (10_000_000 + (expectedCents.get(w.id) ?? 0)) / 100;
+    const cents = 10_000_000 + (expectedCents.get(w.id) ?? 0); // centavos inteiros: nada de float para dinheiro
+    const expected = `${Math.trunc(cents / 100)}.${String(cents % 100).padStart(2, '0')}`;
     return {
       consistent: rec?.consistent === true,
-      balanceMatches: uncertain.has(w.id) || (rec !== undefined && Number(rec.storedBalance.amount) === expected),
+      balanceMatches: uncertain.has(w.id) || (rec !== undefined && rec.storedBalance.amount === expected),
     };
   }));
   const inconsistent = checks.filter((c) => !c.consistent).length;
