@@ -13,8 +13,9 @@ Camadas:
 
 - `src/domain` — regras de negócio em TypeScript puro. Não importa Nest, ORM nem AWS SDK
   (garantido por teste: `test/unit/domain/purity.test.ts`).
-- `src/application` — use cases. Usam o repositório e as métricas da infraestrutura direto, sem
-  portas (por quê: [Camadas](#camadas)).
+- `src/application` — use cases. Falam com o mundo de fora só pelas portas de
+  `src/application/ports.ts` (ver [Camadas](#camadas)); não importam `src/infrastructure` nem o ORM
+  (garantido por teste, no mesmo `purity.test.ts`).
 - `src/infrastructure` — HTTP, SQS, persistência (MikroORM), observabilidade.
 
 ## Topologia
@@ -191,8 +192,13 @@ que falha decide:
 2. se há referência:
    - o tipo não aceita referência (ex.: BET) ou a transação referencia a si mesma →
      `REFERENCE_INVALID_KIND` na hora (esperar não resolveria);
-   - referência de outro provider/player/wallet/moeda/rodada → `REFERENCE_MISMATCH`, mesmo que ela
-     ainda esteja pendente;
+   - referência de outro player/wallet/moeda/rodada → `REFERENCE_MISMATCH`, mesmo que ela
+     ainda esteja pendente. Outro *provider* não chega aqui: a referência é procurada por
+     `(providerId, referenceExternalTransactionId)` (regra 2), então a transação de outro provider é
+     invisível e conta como ausente (`PENDING_REFERENCE`, e `REFERENCE_NOT_FOUND` no fim do prazo).
+     De propósito: o id externo é do espaço de nomes de cada provider, e dois providers podem usar o
+     mesmo id. Rejeitar na hora porque "existe em outro provider" recusaria uma reversão legítima cuja
+     referência ainda está em voo (regra 8);
    - referência de tipo não permitido (ex.: REFUND de um WIN) → `REFERENCE_INVALID_KIND`, também
      mesmo pendente (o tipo dela não muda esperando);
    - ausente ou ainda não aplicada → `PENDING_REFERENCE`;
@@ -216,7 +222,7 @@ violações de contrato e erros de programação.
 | `WALLET_PLAYER_MISMATCH` | Player não é o dono da wallet | Corrigir o payload |
 | `REFERENCE_NOT_FOUND` | Referência não chegou no prazo (10 tentativas, ~4 min) | Reenviar a referência ou desistir |
 | `REFERENCE_NOT_PROCESSED` | Referência existe, mas foi rejeitada/falhou (ou continuou pendente até o prazo) | Não reenviar |
-| `REFERENCE_MISMATCH` | Referência de outro provider/player/wallet/moeda/rodada | Corrigir o payload |
+| `REFERENCE_MISMATCH` | Referência de outro player/wallet/moeda/rodada (outro provider conta como ausente) | Corrigir o payload |
 | `REFERENCE_INVALID_KIND` | Tipo de referência não permitido | Corrigir o payload |
 | `REFERENCE_ALREADY_REVERSED` | Já revertida pelo mesmo tipo | Não reenviar |
 | `AMOUNT_MISMATCH` | Valor da reversão diferente da referência | Corrigir o payload |
@@ -281,7 +287,8 @@ rejeitada por `CURRENCY_MISMATCH` ou `WALLET_PLAYER_MISMATCH` precisa ficar grav
 
 Índices além das constraints: `UNIQUE (wallet_id, wallet_version)` no ledger (histórico por
 cursor, uma versão = um lançamento), parcial `WHERE status = 'PENDING_REFERENCE'` para achar quem espera uma referência,
-parcial `WHERE published_at IS NULL` para o publisher da outbox.
+parcial `WHERE published_at IS NULL` em `occurred_at` (lag da outbox) e em
+`(next_attempt_at, occurred_at, id)` (claim do publisher, migration 4).
 
 Cada linha da tabela acima tem um teste em `test/integration/schema.test.ts` que tenta violá-la.
 Os testes de integração rodam num banco próprio (`<banco>_test`, recriado a cada execução), nunca no
@@ -346,9 +353,19 @@ ela foi decidida. O replay devolve esse valor, inclusive para LOSS e REJECTED, q
 
 ### Camadas
 
-`src/application` orquestra; `wager.repository.ts` faz o SQL dentro da transação. Não há interface
-de repositório: existe uma implementação só, e os testes usam Postgres real (o desafio proíbe
-substituir o banco por mock), então a interface seria cerimônia sem uso.
+`src/application` orquestra e declara o que precisa em `ports.ts`; `src/infrastructure` implementa:
+
+| Porta (`src/application/ports.ts`) | Adaptador | Para quê |
+|---|---|---|
+| `UnitOfWork` → `WagerStore` | `MikroUnitOfWork` → `WagerRepository` | Uma transação SQL; tudo que o store grava dentro dela é commitado junto |
+| `MetricsRecorder` | `Metrics` (Prometheus em memória) | Contadores e histograma do §12 |
+| `ReconciliationSource` | `WagerQueries` | Saldo + somas do ledger na mesma foto do banco |
+
+As portas são `abstract class` porque o Nest usa a classe como token de injeção (`app.module.ts`
+liga cada porta ao adaptador). Detalhes do Postgres ficam no adaptador: o `MikroUnitOfWork` conta
+conflito de lock na métrica e traduz violação de `UNIQUE` para `UniqueViolationError` (com o nome
+da constraint), que é o que os use cases tratam. Os testes continuam com Postgres real — as portas
+servem ao limite entre as camadas, não para trocar o banco por mock.
 
 ## API HTTP
 
@@ -369,7 +386,11 @@ coisa), 400/409 pedem correção do payload, 503 pode reenviar, 404 é wallet er
 
 O replay devolve o estado gravado da transação: igual à primeira resposta, com uma exceção — uma
 PENDING_REFERENCE (202) resolvida depois responde com o desfecho (200 ou 422). O worker de
-referências grava o saldo observado do momento em que resolveu.
+referências grava o saldo observado do momento em que resolveu. Por quê: o 202 não é um resultado,
+é "ainda não decidido". A regra 7 fala de operação *já processada*, e o resultado original dela é a
+decisão do worker (com o saldo daquele momento). Congelar o 202 deixaria o provedor sem nunca
+saber o desfecho pelo mesmo canal. Enquanto continua pendente, o replay devolve o 202 com o saldo
+da primeira resposta.
 
 **503 de verdade:** o conversor de erros do MikroORM para Postgres só reconhece deadlock; lock
 timeout e conexão recusada chegam como erro genérico. Por isso `transient-errors.ts` olha o SQLSTATE
@@ -427,8 +448,14 @@ grava `published_at` ou o próximo retry → commit.
 - Publishers concorrentes (outras instâncias) pegam lotes disjuntos (teste com dois publishers).
 - Morreu depois de publicar e antes do commit: o lote é republicado com o mesmo `eventId`. A FIFO
   descarta a duplicata dentro de 5 min; depois disso, o consumidor deduplica por `eventId`.
-- SQS fora ou lento (timeout de 10 s): o lote inteiro vai para o backoff da outbox (1s, 2s… até 5 min).
-  Sem limite de tentativas: um evento nunca é descartado.
+- SQS fora ou lento (timeout de 10 s): o lote inteiro vai para o backoff da outbox (1s, 2s… até 5 min),
+  contado a partir do fim da chamada. Sem limite de tentativas: um evento nunca é descartado.
+  O prazo é um `Promise.race` contra o `AbortSignal`: no Bun, o SDK não derruba o socket pendurado
+  quando o signal dispara, e a chamada ficava presa até o `requestTimeout` de 30 s (que, sem
+  `throwOnRequestTimeout`, só gerava aviso). Se a chamada abandonada ainda publicar, o retry vira
+  duplicata segura (mesmo `MessageDeduplicationId`). Teste: SQS que aceita a conexão e nunca responde.
+- Busca das vencidas pelo índice parcial `outbox_due_idx (next_attempt_at, occurred_at, id) WHERE
+  published_at IS NULL`: com o SQS fora, as pendentes em backoff não são lidas a cada volta.
 - Ordem é melhor esforço: só as entradas recusadas pelo SQS voltam para o retry (as aceitas já
   estão na fila; reenviá-las só geraria duplicata). Uma recusa, ou lotes de publishers concorrentes,
   podem publicar eventos da mesma wallet fora de ordem. O consumidor ordena por `walletVersion`
@@ -436,9 +463,12 @@ grava `published_at` ou o próximo retry → commit.
 
 ### Referências fora de ordem (§7.1)
 
-O worker pega até 20 PENDING_REFERENCE vencidas e reavalia cada uma com as mesmas regras
-(`applyWager`), sob o lock da wallet. A linha é relida dentro do lock: se outra instância já
-resolveu ou adiou, não faz nada.
+O worker reserva até 20 PENDING_REFERENCE vencidas e reavalia cada uma com as mesmas regras
+(`applyWager`), sob o lock da wallet. A reserva é um `UPDATE … WHERE id IN (SELECT … FOR NO KEY UPDATE
+SKIP LOCKED)` que empurra `next_reference_attempt_at` para daqui a 2 min: instâncias concorrentes pegam
+linhas diferentes, e uma instância que morre no meio solta as linhas sozinha quando a reserva vence
+(sem gastar tentativa). A linha é relida dentro do lock da wallet e só é tratada se a reserva ainda é
+desta volta.
 
 - Backoff: 1s, 2s, 4s… até 60s entre tentativas (`reference_attempts`, `next_reference_attempt_at`).
 - **Limite: 10 tentativas (~4 min).** Reversão antes da aposta é corrida entre mensagens em voo e
@@ -585,8 +615,6 @@ ser pago. Não alterei: fica para alinhar com o time, junto com a regra 4.
 - PENDING_REFERENCE resolve no ritmo do backoff (até 60s depois da referência chegar), não no
   instante em que ela chega.
 - O publisher segura os locks das linhas da outbox durante a chamada ao SQS (lote pequeno, curto).
-- Todas as instâncias varrem as mesmas PENDING_REFERENCE vencidas; o lock da wallet serializa e a
-  releitura descarta o trabalho repetido (simples, com custo de leituras extras).
 - `POST /wallets` não é idempotente: se o cliente perder a resposta e reenviar, recebe 409 e
   precisa descobrir o id por outro caminho (o desafio não pede busca de wallet por player).
 - A migration 2 preenche `wallet_version` e `observed_balance` das linhas antigas a partir do
