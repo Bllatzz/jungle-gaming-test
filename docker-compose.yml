@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wagering
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+    # 5434 no host: 5432/5433 costumam estar ocupadas por um Postgres local.
+    ports: ["127.0.0.1:5434:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost", "-U", "wagering", "-d", "wagering"] # TCP: o socket unix responde já no servidor temporário do initdb
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    # Fixada: desde a 2026.03.0 a imagem latest exige LOCALSTACK_AUTH_TOKEN.
+    image: localstack/localstack:4.12
+    environment:
+      SERVICES: sqs
+    ports: ["127.0.0.1:4566:4566"]
+    volumes:
+      - ./docker/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    healthcheck:
+      test: ["CMD", "awslocal", "sqs", "get-queue-url", "--queue-name", "wallet-events.fifo"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # Roda as migrations uma vez, antes dos apps: N réplicas não disputam o schema.
+  migrate:
+    image: wagering-processor # mesma imagem do app (um build só)
+    build: .
+    command: ["bun", "run", "migration:up"]
+    environment: &app-env
+      PORT: "3000"
+      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_WAGER_QUEUE: wager-transactions.fifo
+      SQS_WAGER_DLQ: wager-transactions-dlq.fifo
+      SQS_EVENTS_QUEUE: wallet-events.fifo
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  app:
+    image: wagering-processor
+    build: .
+    environment: *app-env
+    # Faixa de portas para `docker compose up --scale app=3` (3000, 3001, 3002).
+    ports: ["127.0.0.1:3000-3002:3000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      localstack: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r = await fetch('http://localhost:3000/health/ready'); process.exit(r.ok ? 0 : 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
