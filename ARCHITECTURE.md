@@ -64,7 +64,7 @@ registrá-la nesse arquivo.
 | `wallet-events.fifo` | Saída: destino dos eventos publicados pela outbox. O desafio pede publicação mas não define o destino; decisão nossa |
 
 Deduplicação e ordenação do SQS FIFO são **otimização**. A garantia de não duplicar efeitos será
-do banco — inbox persistente e constraints de unicidade *(planejado — partes 3 e 5)*.
+do banco — inbox persistente e constraints de unicidade (schema pronto; consumer na parte 5).
 `MessageDeduplicationId` será sempre explícito (`messageId` na entrada, `eventId` na outbox).
 
 `wallet-events.fifo` não tem DLQ: este serviço só publica nela. Quem consome os eventos define
@@ -179,6 +179,62 @@ violações de contrato e erros de programação.
 - Factories de evento e a outbox recusam estado errado (ex.: evento de rejeição para transação
   pendente, publicar duas vezes) em vez de gerar um contrato quebrado.
 - Saldo que estouraria `NUMERIC(20,2)` é recusado no domínio, antes de chegar ao banco.
+
+## Persistência (`src/infrastructure/persistence`)
+
+### Mapeamento
+
+O domínio não conhece o ORM. As tabelas são mapeadas como **linhas planas** (`defineEntity` em
+`entities.ts`) e `mappers.ts` converte linha ↔ objeto de domínio, sempre lendo por `rehydrate`.
+Mapear as classes de domínio direto brigaria com o construtor privado, os campos `_balance` e o
+`Money` em duas colunas. Sobre as linhas o MikroORM continua dando Unit of Work,
+`em.transactional()` e `LockMode` — que é o que a parte transacional usa.
+
+**Money:** duas colunas, `amount NUMERIC(20,2)` + `currency CHAR(3)`. A propriedade é `decimal` em
+modo `string`: o driver `pg` devolve `NUMERIC` como string e ela vai direto para `Money.from`, sem
+nunca passar por `number`. 18 dígitos inteiros, mesmo limite do `Money.from` (testado no limite).
+
+### Schema e garantias no banco
+
+A migration é escrita à mão (`migrations/Migration20261114120000.ts`), porque o diff automático do
+MikroORM não conhece `CHECK`, trigger nem índice parcial — e tentaria apagá-los. Por isso
+`migration:create` gera sempre uma migration em branco. Enums viram `TEXT` + `CHECK` (trocar uma
+lista é uma migration simples, sem `ALTER TYPE`).
+
+| Garantia (§6) | Onde no banco |
+|---|---|
+| Uma wallet por player + moeda | `UNIQUE (player_id, currency)` |
+| Saldo nunca negativo | `CHECK (balance >= 0)` em `wallets`; `balance_before/after >= 0` no ledger |
+| Ledger imutável | trigger bloqueia `UPDATE`, `DELETE` e `TRUNCATE` |
+| Lançamento coerente | `CHECK` da aritmética `before ± amount = after`; `amount > 0` |
+| Lançamento na moeda da wallet | FK composta `(wallet_id, currency)` → `wallets (id, currency)` |
+| Lançamento bate com a sua transação | FK composta `(transaction_id, wallet_id, amount, currency)` → `wager_transactions` |
+| No máximo um lançamento por transação | `UNIQUE (transaction_id)` |
+| Idempotência | `UNIQUE (provider_id, idempotency_key)` |
+| Referência resolvida por provider + id externo | `UNIQUE (provider_id, external_transaction_id)` |
+| REFUND/ROLLBACK exigem referência | `CHECK` |
+| Regra 4 (uma reversão por tipo) | índice único parcial `(reference_transaction_id, kind) WHERE status = 'PROCESSED' AND kind IN ('REFUND','ROLLBACK')`, mais `CHECK` exigindo a referência resolvida (NULL escaparia do índice) e proibindo auto-referência |
+| Transação é auditável | trigger: linha terminal não muda; nenhuma linha é apagada; campos do payload (os que entram no `payload_hash`) nunca mudam |
+| Status coerente com os campos | `processed_at` ⇔ `PROCESSED`; `failure_code` ⇔ `REJECTED`/`FAILED` |
+| Inbox deduplica | `PRIMARY KEY (consumer_name, message_id)` |
+
+`wager_transactions` **não** tem FK de moeda nem de player com a wallet de propósito: uma transação
+rejeitada por `CURRENCY_MISMATCH` ou `WALLET_PLAYER_MISMATCH` precisa ficar gravada para auditoria.
+
+Índices além das constraints: `(wallet_id, created_at, id)` no ledger (histórico por cursor e
+reconciliação), parcial `WHERE status = 'PENDING_REFERENCE'` para achar quem espera uma referência,
+parcial `WHERE published_at IS NULL` para o publisher da outbox.
+
+Cada linha da tabela acima tem um teste em `test/integration/schema.test.ts` que tenta violá-la.
+Os testes de integração rodam num banco próprio (`<banco>_test`, recriado a cada execução), nunca no
+banco do dev — o ledger é append-only e não dá para limpar.
+
+Os triggers levantam o erro padrão do PL/pgSQL (`P0001`), não `check_violation`: quebrar uma regra
+de imutabilidade é erro de programação, e o app consegue diferenciar de um `CHECK` comum.
+
+O que o banco **não** garante (fica no domínio): que a referência é da mesma wallet/provider/rodada
+e do tipo certo, que só transação `PROCESSED` gera lançamento, e que `wallets.balance` é igual ao
+último `balance_after` do ledger (a reconciliação da parte 4 confere isso).
 
 ## Interpretações das regras de negócio
 
