@@ -94,7 +94,7 @@ describe('consumer', () => {
     await queues.sendWager(data);
     const ack = spyOn(consumer as any, 'delete').mockRejectedValueOnce(new Error('processo morreu antes do ack'));
 
-    await poll(); // commit feito, ack falhou: a mensagem volta depois do backoff (1s)
+    await poll(); // commit feito, ack falhou: a mensagem volta na hora (visibilidade 0) e cai no replay
     ack.mockRestore();
     expect(await balance(wallet.id)).toBe('90.00');
     await pollUntilReceived();
@@ -323,6 +323,16 @@ describe('referência fora de ordem (§7.1)', () => {
     expect(await db().count(OutboxMessageEntity, { aggregateId: wallet.id, eventType: 'WagerTransactionRejected' })).toBe(1);
     expect((await api.send(url, rollback)).body).toMatchObject({ status: 'REJECTED', failureCode: 'REFERENCE_NOT_FOUND' });
     expect(await balance(wallet.id)).toBe('100.00');
+  });
+
+  test('replay de uma transação ainda pendente devolve o saldo da primeira resposta, mesmo depois de o worker tentar', async () => {
+    const wallet = await api.openWallet(url, '100.00');
+    const refund = api.wagerPayload(wallet, 'REFUND', '5.00', { referenceExternalTransactionId: 'ainda-nao-chegou' });
+    expect((await api.send(url, refund)).body.balance.amount).toBe('100.00');
+    await api.send(url, api.wagerPayload(wallet, 'BET', '30.00')); // saldo muda para 70.00
+    await resolver().runOnce(); // tenta, a referência continua faltando
+    expect(await transactionOf(refund)).toMatchObject({ status: 'PENDING_REFERENCE', referenceAttempts: 1 });
+    expect((await api.send(url, refund)).body).toMatchObject({ status: 'PENDING_REFERENCE', balance: { amount: '100.00' }, idempotentReplay: true });
   });
 });
 

@@ -135,7 +135,8 @@ export class WagerRepository {
         referenceTransactionId: row.referenceTransactionId,
         failureCode: row.failureCode,
         processedAt: row.processedAt,
-        observedBalance: row.observedBalance,
+        // ainda pendente: o replay continua devolvendo o saldo da primeira resposta (202), não o de agora
+        ...(row.status === WagerTransactionStatus.PendingReference ? {} : { observedBalance: row.observedBalance }),
         referenceAttempts: schedule.attempts,
         nextReferenceAttemptAt: schedule.nextAttemptAt,
       },
