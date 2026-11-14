@@ -93,6 +93,7 @@ A faixa de portas suporta até 3 réplicas; para mais, amplie `ports` do serviç
 | `infra:up` / `infra:down` | Sobe Postgres + LocalStack / derruba tudo e apaga volumes |
 | `start` / `start:dev` | Sobe o app / com reload automático |
 | `typecheck` | Checagem de tipos (TypeScript strict) |
+| `lint` | Typecheck com as checagens extras do compilador: import/variável/parâmetro sem uso, `switch` sem `break`, caminho sem `return`, `override` explícito, código inalcançável |
 | `migration:create` / `migration:up` / `migration:down` | Cria / aplica / reverte migrations. Migration nova precisa ser registrada em `src/infrastructure/persistence/migrations/index.ts` |
 | `test` | Testes de unidade (sem containers) |
 | `test:integration` | Testes de integração (exige `infra:up`) |

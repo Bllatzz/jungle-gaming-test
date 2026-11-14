@@ -8,6 +8,7 @@
     "start": "bun run src/main.ts",
     "start:dev": "bun --watch src/main.ts",
     "typecheck": "bunx --bun tsc --noEmit",
+    "lint": "bunx --bun tsc --noEmit --noUnusedLocals --noUnusedParameters --noFallthroughCasesInSwitch --noImplicitReturns --noImplicitOverride --allowUnreachableCode false --allowUnusedLabels false",
     "migration:create": "bun run src/infrastructure/persistence/migrate.ts create",
     "migration:up": "bun run src/infrastructure/persistence/migrate.ts up",
     "migration:down": "bun run src/infrastructure/persistence/migrate.ts down",

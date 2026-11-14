@@ -6,7 +6,7 @@ import { FailureCode as F } from '../../../src/domain/failure-codes';
 import { Money } from '../../../src/domain/money';
 import { OutboxMessage } from '../../../src/domain/outbox-message';
 import { applyWager } from '../../../src/domain/wager-rules';
-import { type WagerTransaction, WagerTransactionKind as K, WagerTransactionStatus as S } from '../../../src/domain/wager-transaction';
+import { type WagerTransaction, WagerTransactionKind as K } from '../../../src/domain/wager-transaction';
 import { openWallet, type Wallet } from '../../../src/domain/wallet';
 import { brl, NOW, tx, walletWith } from './fixtures';
 
