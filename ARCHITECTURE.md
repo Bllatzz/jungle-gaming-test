@@ -96,6 +96,136 @@ Desenho que seria adotado:
 - Ponto de extensão: guard no-op registrado nas rotas de negócio. Health checks e mensagens SQS
   (canal interno) ficam fora da autenticação, mas o `providerId` da mensagem segue validado.
 
+## Domínio (`src/domain`)
+
+TypeScript puro: nenhum import de Nest, ORM ou AWS SDK (há um teste que garante isso). Todas as
+classes têm construtor privado e factories (`create`/`from`/`open` validam; `rehydrate` só reconstrói).
+
+### Money
+- `decimal.js` com precisão de 40 dígitos: somas e subtrações de valores com 2 casas nunca arredondam.
+- Entrada (`Money.from`) aceita só `^(0|[1-9]\d{0,17})(\.\d{1,2})?$`: rejeita vazio, espaço, sinal,
+  `NaN`, `Infinity`, notação científica, zero à esquerda, mais de 2 casas e mais de 18 dígitos
+  inteiros (o limite cabe em `NUMERIC(20,2)`). `amount` precisa ser string: um `number` vindo do JSON é rejeitado.
+- Internamente pode ficar negativo (ex.: diferença da reconciliação). Saída sempre com 2 casas.
+- Moedas diferentes lançam `CurrencyMismatchError`. O modelo é multi-moeda; o desafio usa BRL.
+
+### Wallet e ledger
+- `debit`/`credit` validam e **devolvem o lançamento** criado: saldo e ledger nascem juntos.
+- `version` começa em 1 e só incrementa quando o saldo muda (movimento de valor zero é rejeitado).
+- `WalletLedgerEntry` é imutável de verdade: campos `readonly`, nenhum método de transição e
+  `Object.freeze`. `create` valida `balanceBefore ± money === balanceAfter` e saldo final ≥ 0.
+- Ledger de partida simples: um lançamento por transação por wallet. Partida dobrada é opcional
+  no desafio e ficou fora pelo prazo.
+- Abertura (`openWallet`): saldo inicial > 0 gera a transação interna `OPENING` (provider `internal`,
+  idempotency key `internal:opening:{walletId}`) já `PROCESSED` e um `CREDIT` de 0 → saldo inicial.
+
+### WagerTransaction
+Segue o esqueleto do desafio. `OPENING` só nasce por `WagerTransaction.opening()`; `create` rejeita.
+REFUND/ROLLBACK exigem `referenceExternalTransactionId`. Valor deve ser > 0 (LOSS aceita 0).
+
+Transições (qualquer outra lança `InvalidTransactionStateError`):
+
+```
+PENDING           → PROCESSED | REJECTED | PENDING_REFERENCE | FAILED
+PENDING_REFERENCE → PROCESSED | REJECTED | FAILED | PENDING_REFERENCE (nova tentativa)
+PROCESSED, REJECTED, FAILED → terminais
+```
+
+### Regras (`applyWager`)
+Uma função de domínio decide e aplica cada transação; o use case só carrega os dados e persiste.
+Assim cada regra é testada sem banco. Antes de tudo, duas guardas de programação (lançam erro sem
+tocar na wallet): transação já terminal e transação de outra wallet. Depois, a primeira checagem
+que falha decide:
+
+1. moeda da transação = moeda da wallet; player = dono da wallet;
+2. se há referência:
+   - o tipo não aceita referência (ex.: BET) ou a transação referencia a si mesma →
+     `REFERENCE_INVALID_KIND` na hora (esperar não resolveria);
+   - referência de outro provider/player/wallet/moeda/rodada → `REFERENCE_MISMATCH`, mesmo que ela
+     ainda esteja pendente;
+   - ausente ou ainda não aplicada → `PENDING_REFERENCE`;
+   - senão precisa estar `PROCESSED`, ter tipo compatível (REFUND→BET; ROLLBACK→BET/WIN/REFUND;
+     WIN e LOSS→BET), não ter sido revertida pelo mesmo tipo e ter o mesmo valor (REFUND/ROLLBACK).
+     "Já revertida" vem antes de "valor errado" para o provedor receber o sinal de não reenviar;
+3. LOSS → `PROCESSED` sem lançamento;
+4. débito sem saldo → `INSUFFICIENT_FUNDS` (BET) ou `REVERSAL_INSUFFICIENT_FUNDS` (ROLLBACK);
+5. aplica débito/crédito e marca `PROCESSED`.
+
+Rejeição de negócio **não é exceção**: vira `failureCode` na transação. Exceções ficam para
+violações de contrato e erros de programação.
+
+### Códigos de falha
+
+| Código | Quando | O provedor deve |
+|---|---|---|
+| `INSUFFICIENT_FUNDS` | BET maior que o saldo | Não reenviar |
+| `REVERSAL_INSUFFICIENT_FUNDS` | ROLLBACK deixaria o saldo negativo | Não reenviar; tratar como caso operacional |
+| `CURRENCY_MISMATCH` | Moeda diferente da wallet | Corrigir o payload |
+| `WALLET_PLAYER_MISMATCH` | Player não é o dono da wallet | Corrigir o payload |
+| `REFERENCE_NOT_FOUND` | Referência não chegou no prazo (parte 5) | Reenviar a referência ou desistir |
+| `REFERENCE_NOT_PROCESSED` | Referência existe, mas foi rejeitada/falhou | Não reenviar |
+| `REFERENCE_MISMATCH` | Referência de outro provider/player/wallet/moeda/rodada | Corrigir o payload |
+| `REFERENCE_INVALID_KIND` | Tipo de referência não permitido | Corrigir o payload |
+| `REFERENCE_ALREADY_REVERSED` | Já revertida pelo mesmo tipo | Não reenviar |
+| `AMOUNT_MISMATCH` | Valor da reversão diferente da referência | Corrigir o payload |
+| `INTERNAL_ERROR` | Falha permanente de infraestrutura (`FAILED`) | Contatar o suporte |
+
+### Inbox, outbox e eventos
+- `OutboxMessage.scheduleRetry`: backoff exponencial 1s, 2s, 4s… com teto de 5 minutos.
+- Eventos: classe abstrata `IntegrationEvent` e uma subclasse por evento, com `eventType` e
+  `version` no próprio tipo. `data` só carrega `MoneyProps` (strings), nunca `Money`.
+- `aggregateId` é sempre o `walletId`: vira o `MessageGroupId` no SQS FIFO e mantém a ordem por wallet.
+- Ids (`eventId`, ids de transação e de lançamento) são sempre passados de fora: o domínio é determinístico.
+- Factories de evento e a outbox recusam estado errado (ex.: evento de rejeição para transação
+  pendente, publicar duas vezes) em vez de gerar um contrato quebrado.
+- Saldo que estouraria `NUMERIC(20,2)` é recusado no domínio, antes de chegar ao banco.
+
+## Interpretações das regras de negócio
+
+### Uma dúvida sobre REFUND e ROLLBACK na mesma aposta
+
+Lendo as regras da seção 7, uma combinação me chamou atenção:
+
+> 3. `REFUND` só referencia `BET`. `ROLLBACK` referencia `BET`, `WIN` ou `REFUND`.
+> 4. Uma referência não pode ser revertida duas vezes pelo mesmo tipo de operação.
+
+O detalhe está no "pelo mesmo tipo". A regra impede dois REFUNDs na mesma aposta, ou dois
+ROLLBACKs, mas não impede um REFUND seguido de um ROLLBACK. Como os dois podem apontar para uma
+`BET`, isso é possível:
+
+```
+BET      -80.00   saldo  20.00
+REFUND   +80.00   saldo 100.00   (devolve a aposta)
+ROLLBACK +80.00   saldo 180.00   (devolve a mesma aposta de novo)
+```
+
+O jogador apostou 80 e recebeu 160 de volta.
+
+Sei que REFUND e ROLLBACK não são a mesma coisa: o REFUND é o reembolso de uma aposta cancelada,
+e o ROLLBACK desfaz uma operação que não deveria ter acontecido (de um WIN, por exemplo, ele tira
+o prêmio). Mas quando o alvo é uma `BET`, os dois fazem exatamente o mesmo: devolvem o valor
+apostado. Na prática, a aposta acaba sendo devolvida duas vezes.
+
+**O que eu fiz:** segui a regra como está escrita, uma reversão por tipo. É a regra de negócio
+que foi passada, e não achei correto mudá-la por conta própria.
+
+**O que eu acho:** não me parece a regra certa. Isso bate de frente com o invariante da seção 3
+("o sistema não pode duplicar créditos"), e em produção seria uma brecha: quem descobrisse
+poderia gerar dinheiro repetindo esse ciclo de aposta, reembolso e rollback.
+
+**O que eu sugeriria:** cada transação só poder ser revertida uma vez, independente do tipo. O
+ROLLBACK de um REFUND continuaria valendo, porque aí ele desfaz o reembolso. A mudança seria
+pequena: no banco, a restrição de unicidade da reversão passa de `(referência, tipo)` para só
+`(referência)`, e no domínio a checagem deixa de olhar o tipo. Deixo registrado para ser
+conversado com o time, em vez de alterar a regra sem avisar.
+
+### WIN ou LOSS sobre uma aposta já devolvida — ponto em aberto
+
+O desafio não diz o que fazer se chegar um `WIN` referenciando uma `BET` que já foi reembolsada
+(REFUND) ou desfeita (ROLLBACK). Hoje ele é aceito e credita o prêmio, porque nenhuma regra proíbe.
+Pela mesma lógica da dúvida acima, um prêmio sobre uma aposta cancelada provavelmente não deveria
+ser pago. Não alterei: fica para alinhar com o time, junto com a regra 4.
+
 ## Limitações conhecidas
 
 - LocalStack fixado em 4.12: a imagem `latest` passou a exigir auth token (2026.03.0).
