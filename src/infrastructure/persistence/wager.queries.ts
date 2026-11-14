@@ -9,6 +9,23 @@ import * as map from './mappers';
 export class WagerQueries {
   constructor(private readonly orm: MikroORM) {}
 
+  /** Para as métricas: quantos eventos esperam publicação e a idade do mais antigo (outbox lag). */
+  async outboxStats(): Promise<{ pending: number; lagSeconds: number }> {
+    return this.orm.em.fork().transactional(async (em) => {
+      const conn = em.getConnection();
+      const ctx = em.getTransactionContext();
+      // scrape com banco lento não pode segurar conexão do pool: a query desiste junto com o scrape
+      await conn.execute(`set local statement_timeout = '2s'`, [], 'run', ctx);
+      const [row] = await conn.execute<{ pending: string; lag: string | null }[]>(
+        // greatest: occurred_at vem do relógio do app, que pode estar à frente do banco
+        `select count(*) as pending, greatest(0, extract(epoch from now() - min(occurred_at))) as lag
+           from outbox_messages where published_at is null`,
+        [], 'all', ctx,
+      );
+      return { pending: Number(row?.pending ?? 0), lagSeconds: Number(row?.lag ?? 0) };
+    });
+  }
+
   async wallet(id: string): Promise<Wallet | undefined> {
     const row = await this.orm.em.fork().findOne(WalletEntity, { id });
     return row ? map.toWallet(row) : undefined;

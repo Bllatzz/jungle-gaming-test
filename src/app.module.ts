@@ -3,6 +3,8 @@ import { type DynamicModule, Module } from '@nestjs/common';
 import { ENV, type Env } from './config/env';
 import { SqsGateway } from './infrastructure/messaging/sqs.gateway';
 import { HealthController } from './infrastructure/observability/health.controller';
+import { Metrics } from './infrastructure/observability/metrics';
+import { MetricsController } from './infrastructure/observability/metrics.controller';
 import { createOrmConfig } from './infrastructure/persistence/mikro-orm.config';
 import { WagerQueries } from './infrastructure/persistence/wager.queries';
 import { WagerTransactionsController } from './infrastructure/http/wager-transactions.controller';
@@ -22,10 +24,11 @@ export class AppModule {
     return {
       module: AppModule,
       imports: [MikroOrmModule.forRoot(createOrmConfig(env))],
-      controllers: [HealthController, WalletsController, WagerTransactionsController],
+      controllers: [HealthController, MetricsController, WalletsController, WagerTransactionsController],
       providers: [
         { provide: ENV, useValue: env },
         SqsGateway,
+        Metrics,
         WagerQueries,
         ProcessWagerTransaction,
         OpenWallet,

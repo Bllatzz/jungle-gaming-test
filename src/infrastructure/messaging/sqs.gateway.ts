@@ -32,6 +32,14 @@ export class SqsGateway implements OnApplicationShutdown {
     await this.client.send(new GetQueueAttributesCommand({ QueueUrl, AttributeNames: ['QueueArn'] }), { abortSignal });
   }
 
+  /** ApproximateNumberOfMessages da fila (para as métricas). */
+  async approximateDepth(name: string, abortSignal?: AbortSignal): Promise<number> {
+    const QueueUrl = await this.queueUrl(name, abortSignal);
+    const { Attributes } = await this.client.send(
+      new GetQueueAttributesCommand({ QueueUrl, AttributeNames: ['ApproximateNumberOfMessages'] }), { abortSignal });
+    return Number(Attributes?.ApproximateNumberOfMessages ?? 0);
+  }
+
   onApplicationShutdown(): void {
     this.client.destroy(); // fecha os sockets keep-alive do SDK
   }
