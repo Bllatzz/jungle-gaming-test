@@ -44,6 +44,7 @@ export const WagerTransactionEntity = defineEntity({
     failureCode: p.enum(() => FailureCode).nullable(),
     createdAt: p.datetime(),
     processedAt: p.datetime().nullable(),
+    observedBalance: p.decimal('string').precision(20).scale(2).nullable(),
   },
 });
 export type WagerTransactionRow = InferEntity<typeof WagerTransactionEntity>;
@@ -60,6 +61,7 @@ export const LedgerEntryEntity = defineEntity({
     currency: p.string().columnType('char(3)'),
     balanceBefore: p.decimal('string').precision(20).scale(2),
     balanceAfter: p.decimal('string').precision(20).scale(2),
+    walletVersion: p.integer(),
     createdAt: p.datetime(),
   },
 });

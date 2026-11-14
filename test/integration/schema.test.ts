@@ -22,14 +22,16 @@ import {
 } from '../../src/infrastructure/persistence/entities';
 import * as map from '../../src/infrastructure/persistence/mappers';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
-import { freshTestDatabase } from './test-database';
+import { freshTestDatabase } from '../support/test-database';
 
 const NOW = new Date('2026-11-14T12:00:00.000Z');
 const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
+// saldo observado só importa para o replay (parte 4); aqui qualquer valor válido serve
+const txRow = (t: WagerTransaction) => map.toWagerTransactionRow(t, brl('100.00'));
 let orm: MikroORM;
 
 beforeAll(async () => {
-  orm = await MikroORM.init(createOrmConfig(await freshTestDatabase()));
+  orm = await MikroORM.init(createOrmConfig(await freshTestDatabase('schema')));
   await orm.migrator.up();
 });
 afterAll(() => orm.close());
@@ -47,8 +49,8 @@ async function seedWallet() {
   });
   await orm.em.fork().transactional(async (em) => {
     await em.insert(WalletEntity, map.toWalletRow(wallet));
-    await em.insert(WagerTransactionEntity, map.toWagerTransactionRow(opening!.transaction));
-    await em.insert(LedgerEntryEntity, map.toLedgerEntryRow(opening!.ledgerEntry));
+    await em.insert(WagerTransactionEntity, txRow(opening!.transaction));
+    await em.insert(LedgerEntryEntity, map.toLedgerEntryRow(opening!.ledgerEntry, 1));
   });
   return { wallet, opening: opening! };
 }
@@ -63,8 +65,8 @@ async function seedProcessedBet() {
   });
   if (decision.status !== 'PROCESSED' || !decision.ledgerEntry) throw new Error('BET deveria ser processada');
   await orm.em.fork().transactional(async (em) => {
-    await em.insert(WagerTransactionEntity, map.toWagerTransactionRow(bet));
-    await em.insert(LedgerEntryEntity, map.toLedgerEntryRow(decision.ledgerEntry!));
+    await em.insert(WagerTransactionEntity, txRow(bet));
+    await em.insert(LedgerEntryEntity, map.toLedgerEntryRow(decision.ledgerEntry!, 2));
     await em.nativeUpdate(WalletEntity, { id: wallet.id }, map.toWalletRow(wallet));
   });
   return { wallet, bet, entry: decision.ledgerEntry };
@@ -91,6 +93,36 @@ describe('migration', () => {
   });
 });
 
+describe('migration 2 em banco com dados', () => {
+  test('preenche wallet_version e observed_balance das linhas antigas', async () => {
+    await orm.migrator.down({ to: 'Migration20261114120000' });
+    const conn = orm.em.getConnection();
+    const [w, t1, t2] = [randomUUID(), randomUUID(), randomUUID()];
+    await conn.execute(`insert into wallets values (?, 'p-old', 'BRL', 70, 2, now(), now())`, [w]);
+    await conn.execute(
+      `insert into wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id,
+         player_id, round_id, game_id, kind, amount, currency, status, created_at, processed_at)
+       values (?, 'internal', 'o', 'internal:o', '', ?, 'p-old', 'opening', 'opening', 'OPENING', 100, 'BRL', 'PROCESSED', now(), now()),
+              (?, 'provider-a', 'b', 'provider-a:b', 'h', ?, 'p-old', 'r', 'g', 'BET', 30, 'BRL', 'PROCESSED', now(), now())`,
+      [t1, w, t2, w],
+    );
+    await conn.execute(
+      `insert into wallet_ledger_entries (id, wallet_id, transaction_id, direction, amount, currency, balance_before, balance_after, created_at)
+       values (?, ?, ?, 'CREDIT', 100, 'BRL', 0, 100, now() - interval '1 minute'), (?, ?, ?, 'DEBIT', 30, 'BRL', 100, 70, now())`,
+      [randomUUID(), w, t1, randomUUID(), w, t2],
+    );
+
+    await orm.migrator.up();
+
+    const ledger = await conn.execute(`select wallet_version from wallet_ledger_entries where wallet_id = ? order by created_at`, [w]);
+    expect(ledger.map((r: any) => r.wallet_version)).toEqual([1, 2]);
+    const txs = await conn.execute(`select kind, observed_balance from wager_transactions where wallet_id = ? order by kind`, [w]);
+    expect(txs).toEqual([{ kind: 'BET', observed_balance: '70.00' }, { kind: 'OPENING', observed_balance: '100.00' }]);
+    // os triggers voltaram a valer depois do preenchimento
+    await expect(conn.execute(`update wallet_ledger_entries set wallet_version = 9 where wallet_id = ?`, [w])).rejects.toThrow('append-only');
+  });
+});
+
 describe('round-trip domínio → linha → domínio', () => {
   test('wallet, transação e lançamento voltam iguais (dinheiro como string, sem number)', async () => {
     const { wallet, bet, entry } = await seedProcessedBet();
@@ -106,7 +138,7 @@ describe('round-trip domínio → linha → domínio', () => {
 
     const entryBack = map.toLedgerEntry(await em.findOneOrFail(LedgerEntryEntity, entry.id));
     expect(entryBack.isBalanced()).toBe(true);
-    expect(map.toLedgerEntryRow(entryBack)).toEqual(map.toLedgerEntryRow(entry));
+    expect(map.toLedgerEntryRow(entryBack, 2)).toEqual(map.toLedgerEntryRow(entry, 2));
   });
 
   test('valor no limite de NUMERIC(20,2) não perde precisão', async () => {
@@ -166,33 +198,33 @@ describe('wallets', () => {
 describe('wager_transactions', () => {
   test('mesmo (provider, id externo) duas vezes é recusado', async () => {
     const { bet } = await seedProcessedBet();
-    const row = { ...map.toWagerTransactionRow(bet), id: randomUUID(), idempotencyKey: randomUUID() };
+    const row = { ...txRow(bet), id: randomUUID(), idempotencyKey: randomUUID() };
     await expect(insert(WagerTransactionEntity, row)).rejects.toBeInstanceOf(UniqueConstraintViolationException);
   });
 
   test('mesma idempotency key do mesmo provider é recusada', async () => {
     const { bet } = await seedProcessedBet();
-    const row = { ...map.toWagerTransactionRow(bet), id: randomUUID(), externalTransactionId: randomUUID() };
+    const row = { ...txRow(bet), id: randomUUID(), externalTransactionId: randomUUID() };
     await expect(insert(WagerTransactionEntity, row)).rejects.toBeInstanceOf(UniqueConstraintViolationException);
   });
 
   test('REFUND sem referência externa é recusado', async () => {
     const { wallet } = await seedWallet();
-    const row = { ...map.toWagerTransactionRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00')), kind: WagerTransactionKind.Refund };
+    const row = { ...txRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00')), kind: WagerTransactionKind.Refund };
     await expect(insert(WagerTransactionEntity, row)).rejects.toBeInstanceOf(CheckConstraintViolationException);
   });
 
   test('valor zero só é aceito em LOSS', async () => {
     const { wallet } = await seedWallet();
-    const loss = map.toWagerTransactionRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Loss, '0.00'));
+    const loss = txRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Loss, '0.00'));
     await insert(WagerTransactionEntity, loss);
-    const bet = { ...map.toWagerTransactionRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00')), amount: '0.00' };
+    const bet = { ...txRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00')), amount: '0.00' };
     await expect(insert(WagerTransactionEntity, bet)).rejects.toBeInstanceOf(CheckConstraintViolationException);
   });
 
   test('status e campos coerentes nos dois sentidos (processed_at ⇔ PROCESSED, failure_code ⇔ REJECTED/FAILED)', async () => {
     const { wallet } = await seedWallet();
-    const base = () => map.toWagerTransactionRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00'));
+    const base = () => txRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00'));
     for (const row of [
       { ...base(), status: WagerTransactionStatus.Processed },
       { ...base(), status: WagerTransactionStatus.Rejected },
@@ -205,7 +237,7 @@ describe('wager_transactions', () => {
 
   test('kind, status, failure_code e moeda fora da lista são recusados', async () => {
     const { wallet } = await seedWallet();
-    const base = () => map.toWagerTransactionRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00'));
+    const base = () => txRow(newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00'));
     for (const row of [
       { ...base(), kind: 'JACKPOT' },
       { ...base(), status: 'DONE' },
@@ -227,7 +259,7 @@ describe('wager_transactions', () => {
   test('transação pendente não é apagada nem tem campos do payload alterados', async () => {
     const { wallet } = await seedWallet();
     const pending = newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Bet, '1.00');
-    await insert(WagerTransactionEntity, map.toWagerTransactionRow(pending));
+    await insert(WagerTransactionEntity, txRow(pending));
     await expect(orm.em.fork().nativeUpdate(WagerTransactionEntity, { id: pending.id }, { amount: '999.00' }))
       .rejects.toThrow('immutable');
     await expect(orm.em.fork().nativeDelete(WagerTransactionEntity, { id: pending.id })).rejects.toThrow('cannot be deleted');
@@ -237,9 +269,9 @@ describe('wager_transactions', () => {
     const { wallet } = await seedWallet();
     const refund = newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Refund, '1.00', 'bet-que-nao-chegou');
     refund.markPendingReference();
-    await insert(WagerTransactionEntity, map.toWagerTransactionRow(refund));
+    await insert(WagerTransactionEntity, txRow(refund));
     refund.reject(FailureCode.ReferenceNotFound);
-    await orm.em.fork().nativeUpdate(WagerTransactionEntity, { id: refund.id }, map.toWagerTransactionRow(refund));
+    await orm.em.fork().nativeUpdate(WagerTransactionEntity, { id: refund.id }, txRow(refund));
   });
 
   test('regra 4: a mesma BET não pode ser revertida duas vezes pelo mesmo tipo', async () => {
@@ -247,7 +279,7 @@ describe('wager_transactions', () => {
     const refund = (id = randomUUID()) => {
       const r = newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Refund, '30.00', bet.externalTransactionId);
       r.markProcessed(bet.id, NOW);
-      return { ...map.toWagerTransactionRow(r), id };
+      return { ...txRow(r), id };
     };
     await insert(WagerTransactionEntity, refund());
     await expect(insert(WagerTransactionEntity, refund())).rejects.toBeInstanceOf(UniqueConstraintViolationException);
@@ -255,14 +287,14 @@ describe('wager_transactions', () => {
     // regra 4 literal: um ROLLBACK da mesma BET é outro tipo, então o banco aceita (ver ARCHITECTURE.md)
     const rollback = newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Rollback, '30.00', bet.externalTransactionId);
     rollback.markProcessed(bet.id, NOW);
-    await insert(WagerTransactionEntity, map.toWagerTransactionRow(rollback));
+    await insert(WagerTransactionEntity, txRow(rollback));
   });
 
   test('regra 4 não é contornável com referência NULL nem com auto-referência', async () => {
     const { wallet, bet } = await seedProcessedBet();
     const r = newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Refund, '30.00', bet.externalTransactionId);
     r.markProcessed(bet.id, NOW);
-    const row = map.toWagerTransactionRow(r);
+    const row = txRow(r);
     await expect(insert(WagerTransactionEntity, { ...row, referenceTransactionId: null }))
       .rejects.toBeInstanceOf(CheckConstraintViolationException);
     await expect(insert(WagerTransactionEntity, { ...row, referenceTransactionId: row.id }))
@@ -276,7 +308,7 @@ describe('wager_transactions', () => {
       money: Money.from({ amount: '1.00', currency: 'USD' }),
       status: WagerTransactionStatus.Rejected, failureCode: FailureCode.CurrencyMismatch,
     });
-    await insert(WagerTransactionEntity, map.toWagerTransactionRow(usd));
+    await insert(WagerTransactionEntity, txRow(usd));
   });
 });
 
@@ -292,17 +324,17 @@ describe('wallet_ledger_entries', () => {
 
   test('no máximo um lançamento por transação', async () => {
     const { entry } = await seedProcessedBet();
-    await expect(insert(LedgerEntryEntity, { ...map.toLedgerEntryRow(entry), id: randomUUID() }))
+    await expect(insert(LedgerEntryEntity, { ...map.toLedgerEntryRow(entry, 2), id: randomUUID() }))
       .rejects.toBeInstanceOf(UniqueConstraintViolationException);
   });
 
   test('aritmética desbalanceada é recusada', async () => {
     const { wallet } = await seedWallet();
     const tx = newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Win, '5.00');
-    await insert(WagerTransactionEntity, map.toWagerTransactionRow(tx));
+    await insert(WagerTransactionEntity, txRow(tx));
     const row = {
       id: randomUUID(), walletId: wallet.id, transactionId: tx.id, direction: 'CREDIT',
-      amount: '5.00', currency: 'BRL', balanceBefore: '100.00', balanceAfter: '106.00', createdAt: NOW,
+      amount: '5.00', currency: 'BRL', balanceBefore: '100.00', balanceAfter: '106.00', walletVersion: 2, createdAt: NOW,
     };
     await expect(insert(LedgerEntryEntity, row)).rejects.toBeInstanceOf(CheckConstraintViolationException);
     await expect(insert(LedgerEntryEntity, { ...row, direction: 'DEBIT', balanceAfter: '105.00' }))
@@ -315,10 +347,10 @@ describe('wallet_ledger_entries', () => {
   test('lançamento em moeda diferente da wallet é recusado (FK composta)', async () => {
     const { wallet } = await seedWallet();
     const tx = newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Win, '5.00');
-    await insert(WagerTransactionEntity, map.toWagerTransactionRow(tx));
+    await insert(WagerTransactionEntity, txRow(tx));
     const row = {
       id: randomUUID(), walletId: wallet.id, transactionId: tx.id, direction: 'CREDIT',
-      amount: '5.00', currency: 'USD', balanceBefore: '100.00', balanceAfter: '105.00', createdAt: NOW,
+      amount: '5.00', currency: 'USD', balanceBefore: '100.00', balanceAfter: '105.00', walletVersion: 2, createdAt: NOW,
     };
     await expect(insert(LedgerEntryEntity, row)).rejects.toBeInstanceOf(ForeignKeyConstraintViolationException);
   });
@@ -329,10 +361,10 @@ describe('wallet_ledger_entries ↔ wager_transactions', () => {
     const { wallet } = await seedWallet();
     const other = (await seedWallet()).wallet;
     const tx = newTransaction(wallet.id, wallet.playerId, WagerTransactionKind.Win, '5.00');
-    await insert(WagerTransactionEntity, map.toWagerTransactionRow(tx));
+    await insert(WagerTransactionEntity, txRow(tx));
     const row = {
       id: randomUUID(), walletId: wallet.id, transactionId: tx.id, direction: 'CREDIT',
-      amount: '5.00', currency: 'BRL', balanceBefore: '100.00', balanceAfter: '105.00', createdAt: NOW,
+      amount: '5.00', currency: 'BRL', balanceBefore: '100.00', balanceAfter: '105.00', walletVersion: 2, createdAt: NOW,
     };
     await expect(insert(LedgerEntryEntity, { ...row, walletId: other.id }))
       .rejects.toBeInstanceOf(ForeignKeyConstraintViolationException);

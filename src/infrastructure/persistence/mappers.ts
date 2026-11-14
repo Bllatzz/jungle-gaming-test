@@ -27,7 +27,8 @@ export function toWallet(row: WalletRow): Wallet {
   return Wallet.rehydrate({ ...row, balance: money(row.balance, row.currency) });
 }
 
-export function toWagerTransactionRow(transaction: WagerTransaction): WagerTransactionRow {
+/** observedBalance: saldo da wallet quando a transação foi decidida (regra 7, replay). */
+export function toWagerTransactionRow(transaction: WagerTransaction, observedBalance: Money | undefined): WagerTransactionRow {
   const { money: value, referenceExternalTransactionId, referenceTransactionId, failureCode, processedAt, ...rest } =
     transaction.toState();
   return {
@@ -38,11 +39,12 @@ export function toWagerTransactionRow(transaction: WagerTransaction): WagerTrans
     referenceTransactionId: referenceTransactionId ?? null,
     failureCode: failureCode ?? null,
     processedAt: processedAt ?? null,
+    observedBalance: observedBalance?.toString() ?? null,
   };
 }
 
 export function toWagerTransaction(row: WagerTransactionRow): WagerTransaction {
-  const { amount, currency, referenceExternalTransactionId, referenceTransactionId, failureCode, processedAt, ...rest } = row;
+  const { amount, currency, referenceExternalTransactionId, referenceTransactionId, failureCode, processedAt, observedBalance: _, ...rest } = row;
   return WagerTransaction.rehydrate({
     ...rest,
     money: money(amount, currency),
@@ -53,7 +55,8 @@ export function toWagerTransaction(row: WagerTransactionRow): WagerTransaction {
   });
 }
 
-export function toLedgerEntryRow(entry: WalletLedgerEntry): LedgerEntryRow {
+/** walletVersion: versão da wallet depois deste lançamento (ordem e cursor do histórico). */
+export function toLedgerEntryRow(entry: WalletLedgerEntry, walletVersion: number): LedgerEntryRow {
   return {
     id: entry.id,
     walletId: entry.walletId,
@@ -63,13 +66,15 @@ export function toLedgerEntryRow(entry: WalletLedgerEntry): LedgerEntryRow {
     currency: entry.money.currency,
     balanceBefore: entry.balanceBefore.toString(),
     balanceAfter: entry.balanceAfter.toString(),
+    walletVersion,
     createdAt: entry.createdAt,
   };
 }
 
 export function toLedgerEntry(row: LedgerEntryRow): WalletLedgerEntry {
+  const { walletVersion: _, ...rest } = row;
   return WalletLedgerEntry.rehydrate({
-    ...row,
+    ...rest,
     money: money(row.amount, row.currency),
     balanceBefore: money(row.balanceBefore, row.currency),
     balanceAfter: money(row.balanceAfter, row.currency),
