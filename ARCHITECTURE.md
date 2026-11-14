@@ -59,13 +59,13 @@ registrá-la nesse arquivo.
 
 | Fila | Papel |
 |---|---|
-| `wager-transactions.fifo` | Entrada de transações. `VisibilityTimeout=30`, redrive para a DLQ após 5 recebimentos |
+| `wager-transactions.fifo` | Entrada de transações. `VisibilityTimeout=30`; o app manda para a DLQ no 5º recebimento com falha, redrive após 10 como rede de segurança |
 | `wager-transactions-dlq.fifo` | Mensagens com falha permanente ou que esgotaram as tentativas |
 | `wallet-events.fifo` | Saída: destino dos eventos publicados pela outbox. O desafio pede publicação mas não define o destino; decisão nossa |
 
-Deduplicação e ordenação do SQS FIFO são **otimização**. A garantia de não duplicar efeitos será
-do banco — inbox persistente e constraints de unicidade (schema pronto; consumer na parte 5).
-`MessageDeduplicationId` será sempre explícito (`messageId` na entrada, `eventId` na outbox).
+Deduplicação e ordenação do SQS FIFO são **otimização**. A garantia de não duplicar efeitos é
+do banco — inbox persistente e constraints de unicidade (ver [Mensageria](#mensageria-e-workers)).
+`MessageDeduplicationId` é sempre explícito (`eventId` na outbox, `MessageId` do SQS ao mandar para a DLQ).
 
 `wallet-events.fifo` não tem DLQ: este serviço só publica nela. Quem consome os eventos define
 a própria política de retry/DLQ.
@@ -162,8 +162,8 @@ violações de contrato e erros de programação.
 | `REVERSAL_INSUFFICIENT_FUNDS` | ROLLBACK deixaria o saldo negativo | Não reenviar; tratar como caso operacional |
 | `CURRENCY_MISMATCH` | Moeda diferente da wallet | Corrigir o payload |
 | `WALLET_PLAYER_MISMATCH` | Player não é o dono da wallet | Corrigir o payload |
-| `REFERENCE_NOT_FOUND` | Referência não chegou no prazo (parte 5) | Reenviar a referência ou desistir |
-| `REFERENCE_NOT_PROCESSED` | Referência existe, mas foi rejeitada/falhou | Não reenviar |
+| `REFERENCE_NOT_FOUND` | Referência não chegou no prazo (10 tentativas, ~4 min) | Reenviar a referência ou desistir |
+| `REFERENCE_NOT_PROCESSED` | Referência existe, mas foi rejeitada/falhou (ou continuou pendente até o prazo) | Não reenviar |
 | `REFERENCE_MISMATCH` | Referência de outro provider/player/wallet/moeda/rodada | Corrigir o payload |
 | `REFERENCE_INVALID_KIND` | Tipo de referência não permitido | Corrigir o payload |
 | `REFERENCE_ALREADY_REVERSED` | Já revertida pelo mesmo tipo | Não reenviar |
@@ -239,13 +239,15 @@ e do tipo certo, que só transação `PROCESSED` gera lançamento, e que `wallet
 
 ## Processamento de uma transação (`src/application`)
 
-`ProcessWagerTransaction` é o único caminho de uma transação de aposta — a API usa hoje e o
-consumer SQS vai usar o mesmo. Tudo numa transação SQL só, nesta ordem:
+`ProcessWagerTransaction` é o único caminho de uma transação de aposta — a API HTTP e o consumer
+SQS usam o mesmo. Tudo numa transação SQL só, nesta ordem:
 
 1. `SELECT … FOR UPDATE` na wallet (com `lock_timeout` de 5 s).
-2. Idempotência: já existe transação com a mesma idempotency key ou o mesmo id externo do provider?
-3. `applyWager` (domínio puro) decide.
-4. Grava a transação → o lançamento → o saldo → os eventos na outbox.
+2. Só pela fila: inbox `(consumerName, messageId)` — já visto segue para o replay; novo é gravado.
+3. Idempotência: já existe transação com a mesma idempotency key ou o mesmo id externo do provider?
+4. `applyWager` (domínio puro) decide.
+5. Grava a transação → o lançamento → o saldo → os eventos na outbox (`recordDecision`, o mesmo
+   usado pelo worker de referências).
 
 ### Concorrência: lock pessimista por wallet
 
@@ -309,8 +311,8 @@ O provedor decide só pelo status: 200/202/422 são respostas definitivas (reenv
 coisa), 400/409 pedem correção do payload, 503 pode reenviar, 404 é wallet errada.
 
 O replay devolve o estado gravado da transação: igual à primeira resposta, com uma exceção — uma
-PENDING_REFERENCE (202) resolvida depois responde com o desfecho (200 ou 422). Quem resolver a
-pendência (worker da parte 5) grava o saldo observado do momento da decisão.
+PENDING_REFERENCE (202) resolvida depois responde com o desfecho (200 ou 422). O worker de
+referências grava o saldo observado do momento em que resolveu.
 
 **503 de verdade:** o conversor de erros do MikroORM para Postgres só reconhece deadlock; lock
 timeout e conexão recusada chegam como erro genérico. Por isso `transient-errors.ts` olha o SQLSTATE
@@ -324,6 +326,71 @@ esgotadas) e o código de rede do Node. Os dois casos principais têm teste (wal
 - **Reconciliação:** saldo gravado × créditos − débitos do ledger, lidos na mesma foto do banco
   (`REPEATABLE READ`). Divergência é logada e sinalizada em `consistent: false`; nunca corrigida.
 - `providerId = "internal"` é reservado para as transações OPENING e recusado na API.
+
+## Mensageria e workers
+
+Toda instância roda os três workers (`src/infrastructure/workers`), coordenados só pelo banco —
+sem eleição de líder. `WORKERS_ENABLED=false` sobe só a API (os testes de integração usam isso e
+chamam cada volta direto, sem timers).
+
+### Consumer (`wager-transactions.fifo`)
+
+Uma regra só decide o destino da mensagem: **ack quando o desfecho está no banco**.
+
+| Situação | O que acontece |
+|---|---|
+| PROCESSED, REJECTED (regra de negócio), PENDING_REFERENCE, replay | commit → `DeleteMessage` (ack) |
+| JSON inválido, `type` desconhecido, payload inválido, wallet inexistente, conflito de idempotência, `messageId` reutilizado com outro payload | nada pode ser gravado → DLQ na hora, com atributo `errorCode` |
+| Transitório (banco fora, lock timeout…) ou erro inesperado | sem ack; `ChangeMessageVisibility` com backoff 1s, 2s, 4s… (teto 60s) |
+| 5º recebimento e ainda falhando | DLQ com `RETRIES_EXHAUSTED` (ou `PROCESSING_FAILED` se não era transitório) |
+
+- **Inbox:** gravado dentro da mesma transação de wallet, ledger e outbox. O hash guardado é o do
+  payload de negócio (o mesmo da idempotência): o produtor pode reenviar com outro `occurredAt`.
+- **Ack só depois do commit.** Morreu entre o commit e o ack: a mensagem volta, cai no inbox/replay
+  e é confirmada sem efeito novo (teste com `kill -9` em processo real e teste determinístico).
+- **Limite de tentativas** no app (`MAX_RECEIVES = 5`, pelo `ApproximateReceiveCount`). A redrive
+  policy (`maxReceiveCount = 10`) fica de rede de segurança: mensagens devolvidas sem processar
+  (shutdown, wallet bloqueada no lote) também contam recebimento e não devem cair na DLQ por isso.
+- **Ack falhou depois do commit:** só log, e a mensagem volta na hora (visibilidade 0) para cair no
+  replay. Nunca vai para a DLQ: o efeito já está gravado.
+- **Lote demorado:** o receive pede 30 s de visibilidade e o lote para em 20 s; o resto volta para a
+  fila antes de vencer com a mensagem ainda em andamento.
+- **Ordem por wallet:** depois de uma falha numa wallet, as próximas mensagens dela no mesmo lote
+  voltam para a fila em vez de passar na frente.
+- **SIGTERM:** o long poll é abortado, a mensagem em andamento termina, o resto do lote volta com
+  visibilidade 0 e só então o ORM e o cliente SQS fecham (`beforeApplicationShutdown`).
+- `correlationId`/`causationId` dos eventos gerados = `messageId` da mensagem.
+
+### Outbox publisher (`wallet-events.fifo`)
+
+Cada volta, numa transação: `SELECT … FOR UPDATE SKIP LOCKED` de até 10 eventos pendentes e
+vencidos → `SendMessageBatch` (`MessageGroupId = walletId`, `MessageDeduplicationId = eventId`) →
+grava `published_at` ou o próximo retry → commit.
+
+- Publishers concorrentes (outras instâncias) pegam lotes disjuntos (teste com dois publishers).
+- Morreu depois de publicar e antes do commit: o lote é republicado com o mesmo `eventId`. A FIFO
+  descarta a duplicata dentro de 5 min; depois disso, o consumidor deduplica por `eventId`.
+- SQS fora ou lento (timeout de 10 s): o lote inteiro vai para o backoff da outbox (1s, 2s… até 5 min).
+  Sem limite de tentativas: um evento nunca é descartado.
+- Ordem é melhor esforço: dentro do lote, uma falha segura os eventos seguintes da mesma wallet;
+  entre lotes e publishers concorrentes, não há garantia. O consumidor ordena por `walletVersion`
+  (em `WalletBalanceChanged`) e deduplica por `eventId`.
+
+### Referências fora de ordem (§7.1)
+
+O worker pega até 20 PENDING_REFERENCE vencidas e reavalia cada uma com as mesmas regras
+(`applyWager`), sob o lock da wallet. A linha é relida dentro do lock: se outra instância já
+resolveu ou adiou, não faz nada.
+
+- Backoff: 1s, 2s, 4s… até 60s entre tentativas (`reference_attempts`, `next_reference_attempt_at`).
+- **Limite: 10 tentativas (~4 min).** Reversão antes da aposta é corrida entre mensagens em voo e
+  se resolve em segundos; minutos depois, a referência não vem mais e o provedor precisa saber.
+  Esgotado: `REJECTED` com `REFERENCE_NOT_FOUND` (ou `REFERENCE_NOT_PROCESSED`, se a referência
+  existe mas nunca foi aplicada) e evento `WagerTransactionRejected`.
+- Resolvida: lançamento, saldo, `observed_balance` e eventos, como uma transação nova.
+- Erro que não é regra de negócio (lock timeout, bug): a linha é adiada 60 s sem gastar tentativa,
+  e as outras seguem.
+- O `correlationId` original não é guardado; os eventos do worker usam o id da transação.
 
 ## Interpretações das regras de negócio
 
@@ -379,7 +446,11 @@ ser pago. Não alterei: fica para alinhar com o time, junto com a regra 4.
   `migration:up` de vários lugares ao mesmo tempo não é seguro.
 - O container roda `bun src/main.ts` direto: via `bun run` o SIGTERM terminava em crash (exit 139).
 - Uma wallet muito disputada vira fila no lock: a latência cresce com a disputa (correção acima de vazão).
-- Transações PENDING_REFERENCE ficam paradas até o worker da parte 5 reprocessá-las.
+- PENDING_REFERENCE resolve no ritmo do backoff (até 60s depois da referência chegar), não no
+  instante em que ela chega.
+- O publisher segura os locks das linhas da outbox durante a chamada ao SQS (lote pequeno, curto).
+- Todas as instâncias varrem as mesmas PENDING_REFERENCE vencidas; o lock da wallet serializa e a
+  releitura descarta o trabalho repetido (simples, com custo de leituras extras).
 - `POST /wallets` não é idempotente: se o cliente perder a resposta e reenviar, recebe 409 e
   precisa descobrir o id por outro caminho (o desafio não pede busca de wallet por player).
 - A migration 2 preenche `wallet_version` e `observed_balance` das linhas antigas a partir do

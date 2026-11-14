@@ -56,6 +56,23 @@ curl -X POST localhost:3000/wagering/transactions -H 'content-type: application/
 
 Status HTTP de cada situação: [ARCHITECTURE.md](ARCHITECTURE.md#api-http).
 
+## Pela fila
+
+O app consome `wager-transactions.fifo` com o mesmo use case da API. Mensagem no formato do desafio:
+
+```bash
+docker compose exec localstack awslocal sqs send-message \
+  --queue-url http://localhost:4566/000000000000/wager-transactions.fifo \
+  --message-group-id <walletId> --message-deduplication-id msg-1 \
+  --message-body '{"messageId":"msg-1","type":"WagerTransactionRequested","occurredAt":"2026-07-29T15:00:00.000Z",
+    "data":{"providerId":"provider-a","externalTransactionId":"tx-2","idempotencyKey":"provider-a:tx-2",
+    "playerId":"player-1","walletId":"<walletId>","roundId":"round-1","gameId":"fortune-chimp",
+    "kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
+```
+
+Mensagens que nunca vão dar certo vão para `wager-transactions-dlq.fifo` com o atributo `errorCode`.
+Os eventos de integração (outbox) saem em `wallet-events.fifo`. `WORKERS_ENABLED=false` sobe só a API.
+
 ## Múltiplas instâncias
 
 ```bash
@@ -76,10 +93,10 @@ A faixa de portas suporta até 3 réplicas; para mais, amplie `ports` do serviç
 | `migration:create` / `migration:up` / `migration:down` | Cria / aplica / reverte migrations. Migration nova precisa ser registrada em `src/infrastructure/persistence/migrations/index.ts` |
 | `test` | Testes de unidade (sem containers) |
 | `test:integration` | Testes de integração (exige `infra:up`) |
-| `test:concurrency` | Testes de concorrência, incluindo 3 processos do app ao mesmo tempo (exige `infra:up`) |
+| `test:concurrency` | Testes de concorrência: 3 processos do app ao mesmo tempo, `kill -9` e SIGTERM no meio da carga (exige `infra:up`) |
 
 Os testes de integração e concorrência criam bancos próprios (`wagering_test_<suíte>`), recriados a
-cada execução: nunca tocam o banco de desenvolvimento.
+cada execução, e filas FIFO próprias por execução: nunca tocam o banco nem as filas de desenvolvimento.
 
 ## Observações
 
