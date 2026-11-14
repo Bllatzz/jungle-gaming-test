@@ -17,6 +17,9 @@ test('carrega env válida', () => {
   const env = loadEnv(valid);
   expect(env.port).toBe(3000);
   expect(env.queues.wager).toBe('wager-transactions.fifo');
+  expect(env.workersEnabled).toBe(true);
+  expect(loadEnv({ ...valid, WORKERS_ENABLED: 'false' }).workersEnabled).toBe(false);
+  for (const WORKERS_ENABLED of ['FALSE', '0', 'no']) expect(() => loadEnv({ ...valid, WORKERS_ENABLED })).toThrow('WORKERS_ENABLED');
 });
 
 test('falha nomeando a variável ausente', () => {

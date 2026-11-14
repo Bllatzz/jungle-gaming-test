@@ -13,7 +13,7 @@ export class NotFoundError extends Error {
 export const violatedConstraint = (error: unknown): string | undefined => (error as { constraint?: string }).constraint;
 
 export class ConflictError extends Error {
-  constructor(readonly code: 'IDEMPOTENCY_CONFLICT' | 'WALLET_ALREADY_EXISTS', message: string) {
+  constructor(readonly code: 'IDEMPOTENCY_CONFLICT' | 'WALLET_ALREADY_EXISTS' | 'MESSAGE_ID_CONFLICT', message: string) {
     super(message);
   }
 }

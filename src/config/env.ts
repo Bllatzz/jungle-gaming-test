@@ -7,6 +7,8 @@ export type Env = {
   awsAccessKeyId: string;
   awsSecretAccessKey: string;
   queues: { wager: string; wagerDlq: string; events: string };
+  /** Consumer SQS, publisher da outbox e worker de referências. false: só HTTP (testes chamam as voltas direto). */
+  workersEnabled: boolean;
 };
 
 /** Token de injeção do Nest para o objeto Env. */
@@ -18,6 +20,9 @@ export function loadEnv(source: Record<string, string | undefined>): Env {
     if (!value) throw new Error(`Variável de ambiente obrigatória ausente: ${name}`);
     return value;
   };
+
+  const workers = source.WORKERS_ENABLED?.trim() || 'true';
+  if (workers !== 'true' && workers !== 'false') throw new Error('Variável de ambiente inválida: WORKERS_ENABLED (true|false)');
 
   const rawPort = required('PORT');
   const port = Number(rawPort);
@@ -35,5 +40,6 @@ export function loadEnv(source: Record<string, string | undefined>): Env {
       wagerDlq: required('SQS_WAGER_DLQ'),
       events: required('SQS_EVENTS_QUEUE'),
     },
+    workersEnabled: workers === 'true',
   };
 }

@@ -1,22 +1,17 @@
 import { MikroORM, UniqueConstraintViolationException } from '@mikro-orm/core';
 import { Injectable } from '@nestjs/common';
-import {
-  WagerTransactionPendingReference,
-  WagerTransactionProcessed,
-  WagerTransactionRejected,
-  WalletBalanceChanged,
-} from '../domain/events/wager-events';
 import type { FailureCode } from '../domain/failure-codes';
+import { InboxMessage } from '../domain/inbox-message';
 import { Money } from '../domain/money';
-import { OutboxMessage } from '../domain/outbox-message';
-import { applyWager, type WagerDecision } from '../domain/wager-rules';
+import { applyWager } from '../domain/wager-rules';
 import { WagerTransaction, type WagerTransactionStatus } from '../domain/wager-transaction';
 import type { Wallet } from '../domain/wallet';
 import type { WagerTransactionRow } from '../infrastructure/persistence/entities';
 import { WagerRepository } from '../infrastructure/persistence/wager.repository';
 import { ConflictError, NotFoundError, violatedConstraint } from './errors';
-import { eventContext, type RequestContext } from './event-context';
+import type { RequestContext } from './event-context';
 import { type WagerPayload, wagerPayloadHash } from './payload-hash';
+import { recordDecision } from './wager-outcome';
 
 export interface WagerCommand extends WagerPayload {
   idempotencyKey: string;
@@ -32,10 +27,19 @@ export interface WagerResult {
 }
 
 /**
+ * Entrada pela fila: a mensagem vai para o inbox na mesma transação SQL do efeito financeiro.
+ * O hash gravado é o do payload de negócio: o mesmo messageId com outro payload é erro do produtor.
+ */
+export interface InboxEntry {
+  consumerName: string;
+  messageId: string;
+}
+
+/**
  * Corrida de idempotência entre wallets diferentes (locks diferentes): uma destas constraints estoura e a
  * transação é refeita — na segunda passada ela cai no replay ou no conflito. Qualquer outra violação é bug.
  */
-const IDEMPOTENCY_CONSTRAINTS = new Set(['wager_tx_external_unique', 'wager_tx_idempotency_unique']);
+const IDEMPOTENCY_CONSTRAINTS = new Set(['wager_tx_external_unique', 'wager_tx_idempotency_unique', 'inbox_messages_pkey']);
 const MAX_ATTEMPTS = 3;
 
 /**
@@ -46,12 +50,12 @@ const MAX_ATTEMPTS = 3;
 export class ProcessWagerTransaction {
   constructor(private readonly orm: MikroORM) {}
 
-  async execute(command: WagerCommand, request: RequestContext): Promise<WagerResult> {
+  async execute(command: WagerCommand, request: RequestContext, inbox?: InboxEntry): Promise<WagerResult> {
     const payloadHash = wagerPayloadHash(command);
     newTransaction(command, payloadHash, new Date()); // valida o payload antes de pegar qualquer lock
     for (let attempt = 1; ; attempt++) {
       try {
-        return await this.orm.em.fork().transactional((em) => this.process(new WagerRepository(em), command, payloadHash, request));
+        return await this.orm.em.fork().transactional((em) => this.process(new WagerRepository(em), command, payloadHash, request, inbox));
       } catch (error) {
         const idempotencyRace =
           error instanceof UniqueConstraintViolationException && IDEMPOTENCY_CONSTRAINTS.has(violatedConstraint(error) ?? '');
@@ -62,10 +66,25 @@ export class ProcessWagerTransaction {
     }
   }
 
-  private async process(repo: WagerRepository, command: WagerCommand, payloadHash: string, request: RequestContext): Promise<WagerResult> {
+  private async process(
+    repo: WagerRepository, command: WagerCommand, payloadHash: string, request: RequestContext, inbox: InboxEntry | undefined,
+  ): Promise<WagerResult> {
     // 1. Lock da wallet: serializa tudo desta wallet, em qualquer instância.
     const wallet = await repo.lockWallet(command.walletId);
     if (!wallet) throw NotFoundError.wallet(command.walletId);
+
+    // Inbox: mensagem já vista → segue para o replay abaixo; vista pela primeira vez → registra, junto com o efeito.
+    if (inbox) {
+      const seen = await repo.findInbox(inbox.consumerName, inbox.messageId);
+      if (seen && seen.payloadHash !== payloadHash) {
+        throw new ConflictError('MESSAGE_ID_CONFLICT', `Mensagem ${inbox.messageId} já recebida com outro conteúdo`);
+      }
+      if (!seen) {
+        const message = InboxMessage.receive({ ...inbox, payloadHash, receivedAt: new Date() });
+        message.markProcessed(message.receivedAt);
+        await repo.insertInbox(message);
+      }
+    }
 
     // 2. Idempotência, já sob o lock: ninguém grava a mesma transação desta wallet ao mesmo tempo.
     const existing = await repo.findExisting(command.providerId, command.idempotencyKey, command.externalTransactionId);
@@ -88,11 +107,7 @@ export class ProcessWagerTransaction {
 
     // 4. Grava tudo: transação → lançamento → saldo → eventos (ordem das FKs).
     await repo.insertTransaction(transaction, wallet.balance);
-    if (decision.status === 'PROCESSED' && decision.ledgerEntry) {
-      await repo.appendLedgerEntry(decision.ledgerEntry, wallet.version);
-      await repo.saveWallet(wallet);
-    }
-    await repo.enqueue(eventsFor(transaction, wallet, decision, request, now));
+    await recordDecision(repo, transaction, wallet, decision, request, now);
 
     return {
       transactionId: transaction.id,
@@ -143,20 +158,4 @@ function replay(existing: WagerTransactionRow, idempotencyKey: string, payloadHa
     balance: Money.from({ amount: existing.observedBalance, currency: wallet.currency }),
     idempotentReplay: true,
   };
-}
-
-function eventsFor(
-  transaction: WagerTransaction, wallet: Wallet, decision: WagerDecision, request: RequestContext, now: Date,
-): OutboxMessage[] {
-  const ctx = eventContext(request, now);
-  const events =
-    decision.status === 'PROCESSED'
-      ? [
-          WagerTransactionProcessed.from(transaction, wallet, ctx()),
-          ...(decision.ledgerEntry ? [WalletBalanceChanged.from(wallet, decision.ledgerEntry, ctx())] : []),
-        ]
-      : decision.status === 'REJECTED'
-        ? [WagerTransactionRejected.from(transaction, ctx())]
-        : [WagerTransactionPendingReference.from(transaction, ctx())];
-  return events.map((event) => OutboxMessage.enqueue(event));
 }
