@@ -388,6 +388,24 @@ describe('outbox_messages', () => {
     };
     await expect(insert(OutboxMessageEntity, row)).rejects.toBeInstanceOf(CheckConstraintViolationException);
   });
+
+  test('o claim do publisher acha as vencidas pelo índice, sem ler as que estão em backoff', async () => {
+    const conn = orm.em.getConnection();
+    // SQS fora por um tempo: muitas pendentes em backoff, poucas vencidas
+    await conn.execute(`
+      insert into outbox_messages (id, aggregate_id, event_type, payload, occurred_at, attempts, next_attempt_at)
+      select gen_random_uuid(), 'w', 'X', '{}', now() - interval '1 hour', 3, now() + interval '1 hour' from generate_series(1, 5000)`);
+    await conn.execute(`
+      insert into outbox_messages (id, aggregate_id, event_type, payload, occurred_at, attempts, next_attempt_at)
+      select gen_random_uuid(), 'w', 'X', '{}', now(), 1, now() - interval '1 second' from generate_series(1, 5)`);
+    await conn.execute('analyze outbox_messages');
+    const plan = await conn.execute<{ 'QUERY PLAN': string }[]>(`
+      explain select * from outbox_messages
+        where published_at is null and (next_attempt_at is null or next_attempt_at <= now())
+        order by occurred_at, id limit 10 for update skip locked`);
+    expect(plan.map((l) => l['QUERY PLAN']).join('\n')).toContain('outbox_due_idx');
+    await conn.execute(`delete from outbox_messages where aggregate_id = 'w'`);
+  });
 });
 
 describe('inbox_messages', () => {
