@@ -133,7 +133,8 @@ Desenho que seria adotado:
 - `AuthGuard` validando o JWT pela JWKS do IdP.
 - O `providerId` do token é comparado ao `providerId` do payload — um provedor não submete
   transações em nome de outro.
-- Ponto de extensão: guard no-op registrado nas rotas de negócio. Health checks e mensagens SQS
+- Ponto de extensão: `AuthGuard` no-op (`src/infrastructure/http/auth.guard.ts`) registrado nos
+  controllers de wallets e transações. Health checks e mensagens SQS
   (canal interno) ficam fora da autenticação, mas o `providerId` da mensagem segue validado.
 
 ## Domínio (`src/domain`)
@@ -209,6 +210,11 @@ violações de contrato e erros de programação.
 | `REFERENCE_ALREADY_REVERSED` | Já revertida pelo mesmo tipo | Não reenviar |
 | `AMOUNT_MISMATCH` | Valor da reversão diferente da referência | Corrigir o payload |
 | `INTERNAL_ERROR` | Falha permanente de infraestrutura (`FAILED`) | Contatar o suporte |
+
+`FAILED`/`INTERNAL_ERROR` existem no modelo (`WagerTransaction.fail`), mas nenhum fluxo grava hoje:
+falha transitória volta como 503 (HTTP) ou retry (SQS), e falha permanente na fila vai para a DLQ
+com `errorCode`, porque nesse caso não há transação válida para gravar. Ficam reservados para uma
+falha permanente depois da validação, que hoje não existe.
 
 ### Inbox, outbox e eventos
 - `OutboxMessage.scheduleRetry`: backoff exponencial 1s, 2s, 4s… com teto de 5 minutos.
@@ -412,8 +418,9 @@ grava `published_at` ou o próximo retry → commit.
   descarta a duplicata dentro de 5 min; depois disso, o consumidor deduplica por `eventId`.
 - SQS fora ou lento (timeout de 10 s): o lote inteiro vai para o backoff da outbox (1s, 2s… até 5 min).
   Sem limite de tentativas: um evento nunca é descartado.
-- Ordem é melhor esforço: dentro do lote, uma falha segura os eventos seguintes da mesma wallet;
-  entre lotes e publishers concorrentes, não há garantia. O consumidor ordena por `walletVersion`
+- Ordem é melhor esforço: só as entradas recusadas pelo SQS voltam para o retry (as aceitas já
+  estão na fila; reenviá-las só geraria duplicata). Uma recusa, ou lotes de publishers concorrentes,
+  podem publicar eventos da mesma wallet fora de ordem. O consumidor ordena por `walletVersion`
   (em `WalletBalanceChanged`) e deduplica por `eventId`.
 
 ### Referências fora de ordem (§7.1)
@@ -431,6 +438,84 @@ resolveu ou adiou, não faz nada.
 - Erro que não é regra de negócio (lock timeout, bug): a linha é adiada 60 s sem gastar tentativa,
   e as outras seguem.
 - O `correlationId` original não é guardado; os eventos do worker usam o id da transação.
+
+## Teste de carga
+
+`bun run test:load` (`test/load/run.ts`, precisa do `infra:up`). Ele é autocontido como a suíte de
+concorrência:
+
+- Recria o banco `wagering_test_load` e cria filas FIFO próprias.
+- Sobe 3 processos do app com os workers ligados, então consumer, publisher e worker de referências
+  rodam de verdade e o outbox lag medido é real.
+
+**Metodologia.**
+
+- Abre 200 wallets e 1 hot wallet, todas com saldo alto: a carga mede processamento, não esgota
+  saldo.
+- Espera a outbox drenar e então roda N clientes em loop fechado por 30s. Cada requisição vai para
+  uma instância sorteada.
+- Mistura de requisições: 60% BET 1.00 em wallet sorteada, 15% BET na hot wallet, 10% WIN e 15%
+  reenvio de uma requisição já feita (replay).
+- Latência medida no cliente, percentil nearest-rank.
+- Conflitos e duplicatas: delta dos contadores do `/metrics` somado nas 3 instâncias.
+- Outbox lag: o gauge `outbox_lag_seconds`, amostrado a cada 1s.
+- No fim, duas conferências por wallet; se alguma falhar, o script sai com código 1:
+  - reconciliação: saldo == ledger;
+  - saldo final == inicial ± as respostas da primeira vez (200 aplicada, 422 rejeitada). Esta pega
+    débito duplicado ou perdido, que a reconciliação sozinha não veria (saldo e ledger andam juntos).
+    Wallet com resposta 5xx ou de rede fica fora desta conferência, porque não dá para saber se
+    a transação commitou.
+
+**Ambiente.** Uma máquina com 16 CPUs (WSL2), Bun 1.3.13, Postgres 16 e LocalStack 4.12 no Docker.
+O pool padrão é de 10 conexões por instância. Cliente, 3 apps, Postgres e LocalStack disputam a
+mesma CPU.
+
+**Resultado (2026-11-14):**
+
+| | 16 clientes | 64 clientes |
+|---|---|---|
+| Requisições em 30s | 18.162 | 18.974 |
+| Throughput | 605 req/s | 628 req/s |
+| p50 / p95 / p99 | 15 / 105 / 149 ms | 66 / 329 / 444 ms |
+| p50 / p99 da hot wallet | 84 / 204 ms | 263 / 537 ms |
+| Erros (5xx + rede) | 0% | 0% |
+| Conflitos de lock (timeout/deadlock) | 0 | 0 |
+| Replays detectados | 2.757 | 2.813 |
+| Outbox lag máx (mediana) | 0,48 s (0,1 s) | 12,0 s (6,4 s) |
+| Outbox drenou depois do fim | 0,3 s | 6,9 s |
+| Saldo == ledger | 201/201 | 201/201 |
+| Saldo == inicial ± respostas aplicadas | 201/201 | 201/201 |
+
+**Análise.**
+
+- **O teto é ~600 req/s nesta máquina.** De 16 para 64 clientes a vazão não muda, só a fila cresce
+  e a latência quadruplica. Com tudo na mesma máquina, não dá para separar quanto do teto é CPU,
+  pool (10 conexões por instância) ou Postgres. Medir isso exigiria cliente e banco em máquinas
+  separadas.
+- **Hot wallet.** As transações da mesma wallet são serializadas pelo lock. Os ~90 a 95 por segundo
+  que ela recebeu são só a fatia de 15% da mistura, não um teto medido (para medir o teto, seria
+  preciso um cenário só de hot wallet). O que o teste mostra é a latência dela: cresce com a
+  disputa (p50 de 84 para 263 ms), mas nenhuma estourou o `lock_timeout` de 5s. É a troca
+  escolhida: correção acima de vazão.
+- **Replays também pegam o lock da wallet.** A decisão é lida sob o lock (`process-wager-transaction`),
+  por isso o p95 dos replays sobe com os reenvios da hot wallet. Uma otimização seria ler antes, sem
+  lock, e só travar se ainda não houver decisão. Não fiz: o caminho único é mais simples de provar
+  correto.
+- **Outbox lag sob saturação.** Com 16 clientes, o evento sai em menos de 1s. Com 64, o publisher
+  (lotes de 10, um por vez, por instância) disputa o mesmo pool com as requisições HTTP e fica para
+  trás: até ~12s, e drena em ~7s quando a carga para. Nenhum evento se perde, só atrasa. Para
+  sustentar mais carga: um pool próprio para os workers, lotes paralelos ou mais instâncias de
+  publisher.
+- **Correção sob carga.** Zero 5xx, todas as wallets reconciliadas com o ledger e com o saldo
+  exato que as respostas prometeram: nenhum débito duplicado ou perdido.
+
+Limites do experimento:
+
+- LocalStack não é SQS real: latência e throttling são outros.
+- A carga entra só por HTTP. O consumer SQS usa o mesmo use case, mas a vazão dele não foi medida;
+  a fila participa só pelo publisher da outbox.
+- Rodadas de 30s não mostram efeitos de longo prazo (bloat, autovacuum, crescimento do ledger).
+- Cada cenário rodou uma vez.
 
 ## Interpretações das regras de negócio
 
@@ -497,4 +582,12 @@ ser pago. Não alterei: fica para alinhar com o time, junto com a regra 4.
   ledger; transações antigas sem lançamento (LOSS/REJECTED) ficam sem saldo observado, por isso a
   regra entrou como `NOT VALID` (vale para linhas novas).
 - Reconciliação soma créditos e débitos de toda a vida da wallet: acima de 10^18 de movimento
-  acumulado a soma não cabe no `Money` (limite de `NUMERIC(20,2)`).
+  acumulado a soma não cabe no `Money` (limite de `NUMERIC(20,2)`). Do mesmo jeito, um crédito que
+  levaria o saldo a 10^18 sai como `INVALID_MONEY` (400 / DLQ), não como rejeição gravada.
+- Devolver uma mensagem à fila sem processar (wallet bloqueada no lote, orçamento do lote, shutdown)
+  também conta recebimento no SQS. Se uma mensagem da wallet falha várias vezes, as seguintes do mesmo
+  grupo chegam com o contador alto e têm menos tentativas próprias antes da DLQ do app (5); a redrive
+  em 10 pega o caso extremo, já sem `errorCode`.
+- O worker de referências adia 60 s, sem gastar tentativa, uma linha que dá erro que não é de negócio.
+  Um erro que se repete sempre (bug) deixa a linha pendente para sempre, com log de erro a cada volta;
+  o caminho certo seria marcar `FAILED`/`INTERNAL_ERROR` depois de N erros.
