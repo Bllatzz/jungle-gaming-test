@@ -6,7 +6,7 @@ import type { INestApplication } from '@nestjs/common';
 import { MAX_REFERENCE_ATTEMPTS, ResolvePendingReferences } from '../../src/application/resolve-pending-references';
 import { createApp } from '../../src/bootstrap';
 import type { Env } from '../../src/config/env';
-import { OutboxPublisher } from '../../src/infrastructure/messaging/outbox-publisher';
+import { OutboxPublisher, SQS_TIMEOUT_MS } from '../../src/infrastructure/messaging/outbox-publisher';
 import { CONSUMER_NAME, MAX_RECEIVES, WagerConsumer } from '../../src/infrastructure/messaging/wager-consumer';
 import {
   InboxMessageEntity, LedgerEntryEntity, OutboxMessageEntity, WagerTransactionEntity,
@@ -257,6 +257,27 @@ describe('outbox', () => {
       await broken.close();
     }
   });
+
+  test('SQS pendurado (aceita a conexão e nunca responde): o publisher desiste no prazo e solta o lote', async () => {
+    // queda real: o socket abre e nada volta — fila inexistente erra na hora e não exercita o timeout
+    const blackhole = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } });
+    const hung = await createApp({ ...queues.env, awsEndpointUrl: `http://127.0.0.1:${blackhole.port}` });
+    hung.useLogger(false);
+    await hung.init();
+    try {
+      while ((await app.get(OutboxPublisher).publishPending()) > 0);
+      const wallet = await api.openWallet(url, '100.00');
+      const started = Date.now();
+      expect(await hung.get(OutboxPublisher).publishPending()).toBe(0);
+      expect(Date.now() - started).toBeLessThan(SQS_TIMEOUT_MS + 2_000);
+      const retried = await db().find(OutboxMessageEntity, { aggregateId: wallet.id });
+      expect(retried.length).toBeGreaterThan(0);
+      expect(retried.every((m) => m.attempts === 1 && m.publishedAt === null && m.nextAttemptAt! > new Date())).toBe(true);
+    } finally {
+      await hung.close();
+      blackhole.stop(true);
+    }
+  }, SQS_TIMEOUT_MS + 15_000);
 });
 
 describe('referência fora de ordem (§7.1)', () => {

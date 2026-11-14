@@ -1,5 +1,6 @@
 import { SendMessageBatchCommand } from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/core';
+import type { OutboxMessage } from '../../domain/outbox-message';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ENV, type Env } from '../../config/env';
 import { Metrics } from '../observability/metrics';
@@ -8,7 +9,7 @@ import { SqsGateway } from './sqs.gateway';
 
 const BATCH = 10; // limite do SendMessageBatch
 /** O lote fica travado no banco durante a chamada: SQS lento não segura a conexão indefinidamente. */
-const SQS_TIMEOUT_MS = 10_000;
+export const SQS_TIMEOUT_MS = 10_000;
 
 /**
  * Publica a outbox na fila de eventos. Cada volta trava um lote com SKIP LOCKED (publishers em outras
@@ -38,17 +39,13 @@ export class OutboxPublisher {
       let failed: Set<string>;
       try {
         const abortSignal = AbortSignal.timeout(SQS_TIMEOUT_MS);
-        const QueueUrl = await this.sqs.queueUrl(this.env.queues.events, abortSignal);
-        const result = await this.sqs.client.send(new SendMessageBatchCommand({
-          QueueUrl,
-          Entries: messages.map((m) => ({
-            Id: m.id,
-            MessageBody: JSON.stringify(m.payload),
-            MessageGroupId: m.aggregateId, // agrupa por wallet (ordem é melhor esforço: ARCHITECTURE.md)
-            MessageDeduplicationId: m.id,
-            MessageAttributes: { eventType: { DataType: 'String', StringValue: m.eventType } },
-          })),
-        }), { abortSignal });
+        // o SDK no Bun não derruba o socket pendurado no abort (a chamada ficava ~30 s): o prazo vale pelo race.
+        // Se a chamada abandonada ainda publicar, o retry gera duplicata segura (mesmo MessageDeduplicationId).
+        const timedOut = new Promise<never>((_, reject) => {
+          abortSignal.addEventListener('abort', () => reject(new Error(`SQS não respondeu em ${SQS_TIMEOUT_MS} ms`)), { once: true });
+        });
+        timedOut.catch(() => {}); // a chamada terminou antes: sem "unhandled rejection"
+        const result = await Promise.race([timedOut, this.send(messages, abortSignal)]);
         // só as recusadas voltam: as aceitas já estão na fila, marcá-las de novo só geraria duplicata
         failed = new Set((result.Failed ?? []).map((f) => f.Id!));
       } catch (error) {
@@ -57,11 +54,26 @@ export class OutboxPublisher {
         failed = new Set(messages.map((m) => m.id));
       }
 
-      for (const m of messages) failed.has(m.id) ? m.scheduleRetry(now) : m.markPublished(now);
+      const done = new Date(); // backoff conta do fim da chamada: um SQS lento não deixa o retry já vencido
+      for (const m of messages) failed.has(m.id) ? m.scheduleRetry(done) : m.markPublished(done);
       await repo.saveOutbox(messages);
       return { published: messages.length - failed.size, retried: failed.size };
     });
     if (retried > 0) this.metrics.inc('wager_retries_total', { component: 'outbox' }, retried); // só depois do commit
     return published;
+  }
+
+  private async send(messages: OutboxMessage[], abortSignal: AbortSignal) {
+    const QueueUrl = await this.sqs.queueUrl(this.env.queues.events, abortSignal);
+    return this.sqs.client.send(new SendMessageBatchCommand({
+      QueueUrl,
+      Entries: messages.map((m) => ({
+        Id: m.id,
+        MessageBody: JSON.stringify(m.payload),
+        MessageGroupId: m.aggregateId, // agrupa por wallet (ordem é melhor esforço: ARCHITECTURE.md)
+        MessageDeduplicationId: m.id,
+        MessageAttributes: { eventType: { DataType: 'String', StringValue: m.eventType } },
+      })),
+    }), { abortSignal });
   }
 }
