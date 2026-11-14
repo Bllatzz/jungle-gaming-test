@@ -180,6 +180,8 @@ describe('POST /wagering/transactions', () => {
       { ...base, money: { amount: '-1.00', currency: 'BRL' } },
       { ...base, walletId: 'nao-e-uuid' },
       { ...base, kind: 'REFUND' }, // REFUND sem referência
+      { ...base, externalTransactionId: 'tx\u0000' }, // o Postgres recusaria: seria 500
+      { ...base, roundId: '\ud800' }, // surrogate solto: colidiria com outro id depois de virar U+FFFD
     ]) {
       expect((await send(body, 'k')).status).toBe(400);
     }

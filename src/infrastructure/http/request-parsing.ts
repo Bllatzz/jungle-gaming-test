@@ -20,6 +20,8 @@ export function text(value: unknown, field: string): string {
   if (typeof value !== 'string' || value === '' || value !== value.trim() || value.length > MAX_TEXT) {
     throw new InvalidRequestError(`${field} deve ser texto de 1 a ${MAX_TEXT} caracteres, sem espaços nas pontas`);
   }
+  // \u0000 o Postgres recusa (viraria 500); surrogate solto vira U+FFFD e dois ids diferentes colidiriam
+  if (value.includes('\u0000') || !value.isWellFormed()) throw new InvalidRequestError(`${field} contém caractere inválido`);
   return value;
 }
 
