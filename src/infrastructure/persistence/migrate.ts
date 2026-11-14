@@ -14,10 +14,10 @@ let orm: MikroORM | undefined;
 try {
   orm = await MikroORM.init(createOrmConfig(loadEnv(process.env)));
   if (command === 'create') {
-    const result = await orm.migrator.create();
-    console.log(result.fileName
-      ? `Criada: ${result.fileName} — registre-a em migrations/index.ts`
-      : 'Nenhuma mudança de schema.');
+    // Sempre em branco: o schema é escrito à mão (checks, triggers e índices parciais que o diff
+    // automático do MikroORM não conhece e tentaria apagar).
+    const result = await orm.migrator.create(undefined, true);
+    console.log(`Criada: ${result.fileName} — escreva o SQL e registre-a em migrations/index.ts`);
   } else if (command === 'up') {
     console.log(`Aplicadas: ${(await orm.migrator.up()).length}`);
   } else {
