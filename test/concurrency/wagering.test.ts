@@ -80,7 +80,7 @@ describe('3 instâncias do app ao mesmo tempo', () => {
   beforeAll(async () => {
     instances = ports.map((port) =>
       Bun.spawn(['bun', join(import.meta.dir, '../../src/main.ts')], {
-        env: { ...process.env, PORT: String(port), DATABASE_URL: env.databaseUrl },
+        env: { ...process.env, PORT: String(port), DATABASE_URL: env.databaseUrl, WORKERS_ENABLED: 'false' },
         stdout: 'ignore',
         stderr: 'inherit', // se uma instância não subir, o motivo aparece na saída do teste
       }),

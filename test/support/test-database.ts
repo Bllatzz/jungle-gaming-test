@@ -20,7 +20,8 @@ export async function freshTestDatabase(suite: string, migrate = false): Promise
     await admin.close();
   }
   url.pathname = `/${name}`;
-  const testEnv = { ...env, databaseUrl: url.toString() };
+  // workers desligados: um teste que quer consumer/publisher chama as voltas direto (determinístico)
+  const testEnv = { ...env, databaseUrl: url.toString(), workersEnabled: false };
   if (migrate) {
     const orm = await MikroORM.init(createOrmConfig(testEnv));
     await orm.migrator.up().finally(() => orm.close());
