@@ -59,6 +59,8 @@ export function applyWager(input: ApplyWagerInput): WagerDecision {
     const selfReference = transaction.referenceExternalTransactionId === transaction.externalTransactionId;
     if (!ALLOWED_REFERENCE_KINDS[transaction.kind] || selfReference) return reject(FailureCode.ReferenceInvalidKind);
     if (reference && !sameContext(transaction, reference)) return reject(FailureCode.ReferenceMismatch);
+    // o tipo da referência não muda enquanto ela espera: tipo errado rejeita mesmo com ela pendente
+    if (reference && !ALLOWED_REFERENCE_KINDS[transaction.kind]!.includes(reference.kind)) return reject(FailureCode.ReferenceInvalidKind);
 
     // Regra 8: referência ausente (ou ainda não aplicada) → espera e reprocessa depois.
     if (!reference || reference.status === Status.Pending || reference.status === Status.PendingReference) {

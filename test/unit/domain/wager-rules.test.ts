@@ -219,6 +219,14 @@ describe('ROLLBACK', () => {
 });
 
 describe('PENDING_REFERENCE reprocessada', () => {
+  test('referência pendente de tipo não permitido → REFERENCE_INVALID_KIND já (esperar não muda o tipo)', () => {
+    const w = walletWith('100.00');
+    const win = tx(K.Win, '10.00', { referenceExternalTransactionId: 'bet-que-nao-chegou' });
+    apply(w, win);
+    expect(win.status).toBe(S.PendingReference);
+    expect(apply(w, tx(K.Refund, '10.00', refTo(win)), win)).toEqual({ status: 'REJECTED', failureCode: F.ReferenceInvalidKind });
+  });
+
   test('quando a referência chega, a mesma transação é processada', () => {
     const w = walletWith('100.00');
     const bet = tx(K.Bet, '10.00');
