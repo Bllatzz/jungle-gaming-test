@@ -11,12 +11,14 @@ import { WagerConsumer } from '../../src/infrastructure/messaging/wager-consumer
 import { JsonLogger } from '../../src/infrastructure/observability/json-logger';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import * as api from '../support/api-client';
-import { corruptBalance, freshTestDatabase } from '../support/test-database';
+import { checkLedgerInvariantAfterEach, corruptBalance, freshTestDatabase } from '../support/test-database';
 import { freshTestQueues } from '../support/test-queues';
 
 // /metrics e logs JSON com o app real (Postgres + LocalStack). Cada teste olha a diferença que ele causou.
 
 let queues: Awaited<ReturnType<typeof freshTestQueues>>;
+const corrupted: string[] = []; // adulterada de propósito pelo teste de reconciliação
+checkLedgerInvariantAfterEach(() => queues.env, () => corrupted);
 let app: INestApplication;
 let orm: MikroORM;
 let url: string;
@@ -167,6 +169,7 @@ describe('métricas', () => {
 
   test('divergência de reconciliação: sinalizada, logada e contada (nunca corrigida)', async () => {
     const wallet = await api.openWallet(url, '100.00');
+    corrupted.push(wallet.id);
     await corruptBalance(queues.env, wallet.id, '90.00'); // corrompe o saldo contornando o banco
     expect(await api.reconcile(url, wallet.id)).toMatchObject({ consistent: false });
     expect((await scrape()).value('reconciliation_divergences_total')).toBe(1);

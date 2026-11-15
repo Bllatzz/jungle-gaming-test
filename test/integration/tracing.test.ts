@@ -10,7 +10,7 @@ import { OutboxMessageEntity } from '../../src/infrastructure/persistence/entiti
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { flushTracing, startTracing } from '../../src/infrastructure/observability/tracing';
 import * as api from '../support/api-client';
-import { freshTestDatabase } from '../support/test-database';
+import { checkLedgerInvariantAfterEach, freshTestDatabase } from '../support/test-database';
 import { freshTestQueues } from '../support/test-queues';
 import { SendMessageCommand } from '@aws-sdk/client-sqs';
 
@@ -22,6 +22,7 @@ let app: INestApplication;
 let orm: MikroORM;
 let url: string;
 let queues: Awaited<ReturnType<typeof freshTestQueues>>;
+checkLedgerInvariantAfterEach(() => queues.env);
 
 beforeAll(async () => {
   startTracing(undefined, exporter);

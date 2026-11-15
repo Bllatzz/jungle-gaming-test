@@ -11,6 +11,9 @@ import type { Request } from 'express';
 import { createRemoteJWKSet, errors, jwtVerify } from 'jose';
 import { ENV, type Env } from '../../config/env';
 
+/** Token emitido para outro serviço do mesmo IdP não vale aqui (mapper de audience no realm do Keycloak). */
+export const AUDIENCE = 'wagering-api';
+
 const providers = new WeakMap<Request, string>();
 
 /** providerId do token da requisição; undefined com a auth desligada. */
@@ -38,7 +41,7 @@ export class AuthGuard implements CanActivate {
 
     let providerId: unknown;
     try {
-      const { payload } = await jwtVerify(token, this.jwks, { issuer: this.env.auth.issuer, algorithms: ['RS256'] });
+      const { payload } = await jwtVerify(token, this.jwks, { issuer: this.env.auth.issuer, audience: AUDIENCE, algorithms: ['RS256'] });
       providerId = payload.provider_id;
     } catch (error) {
       // IdP fora do ar não é culpa do token: o provedor pode reenviar

@@ -15,6 +15,7 @@
     "test": "bun test test/unit",
     "test:integration": "bun test test/integration",
     "test:concurrency": "bun test test/concurrency",
+    "test:e2e": "docker compose --profile auth --profile observability up -d --wait keycloak jaeger && bun test test/e2e",
     "test:load": "bun run test/load/run.ts"
   },
   "dependencies": {

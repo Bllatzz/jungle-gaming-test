@@ -4,9 +4,9 @@ import { ServiceUnavailableException, type ExecutionContext, type INestApplicati
 import { exportJWK, generateKeyPair, SignJWT, type CryptoKey, type JWTPayload } from 'jose';
 import { createApp } from '../../src/bootstrap';
 import type { Env } from '../../src/config/env';
-import { AuthGuard } from '../../src/infrastructure/http/auth.guard';
+import { AUDIENCE, AuthGuard } from '../../src/infrastructure/http/auth.guard';
 import * as api from '../support/api-client';
-import { freshTestDatabase } from '../support/test-database';
+import { checkLedgerInvariantAfterEach, freshTestDatabase } from '../support/test-database';
 
 /**
  * AuthGuard com JWKS de verdade: um IdP de mentira (Bun.serve) publica a chave pública e os testes assinam
@@ -18,6 +18,7 @@ let url: string;
 let idp: ReturnType<typeof Bun.serve>;
 let signingKey: CryptoKey;
 let env: Env;
+checkLedgerInvariantAfterEach(() => env);
 
 beforeAll(async () => {
   const keys = await generateKeyPair('RS256');
@@ -35,10 +36,11 @@ afterAll(async () => {
   idp.stop(true);
 });
 
-async function token(claims: JWTPayload = { provider_id: 'provider-a' }, opts: { issuer?: string; key?: CryptoKey; expiresIn?: string } = {}) {
+async function token(claims: JWTPayload = { provider_id: 'provider-a' }, opts: { issuer?: string; key?: CryptoKey; expiresIn?: string; audience?: string } = {}) {
   return new SignJWT(claims)
     .setProtectedHeader({ alg: 'RS256', kid: 'k1' })
     .setIssuer(opts.issuer ?? ISSUER)
+    .setAudience(opts.audience ?? AUDIENCE)
     .setIssuedAt()
     .setExpirationTime(opts.expiresIn ?? '5m')
     .sign(opts.key ?? signingKey);
@@ -62,7 +64,7 @@ describe('token', () => {
     expect((await fetch(`${url}/metrics`)).status).toBe(200);
   });
 
-  test('sem token, token malformado, assinado por outra chave, de outro emissor, vencido ou sem provider_id → 401', async () => {
+  test('sem token, token malformado, assinado por outra chave, de outro emissor, para outro serviço (aud), vencido ou sem provider_id → 401', async () => {
     const other = (await generateKeyPair('RS256')).privateKey;
     const cases: Record<string, string>[] = [
       {},
@@ -70,6 +72,7 @@ describe('token', () => {
       { authorization: 'Basic dXNlcjpzZW5oYQ==' },
       await bearer(token(undefined, { key: other })),
       await bearer(token(undefined, { issuer: 'http://outro-idp' })),
+      await bearer(token(undefined, { audience: 'account' })),
       await bearer(token(undefined, { expiresIn: '-1m' })),
       await bearer(token({ sub: 'sem-provider' })),
       await bearer(token({ provider_id: '' })),
