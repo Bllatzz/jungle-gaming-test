@@ -39,22 +39,26 @@ describe('concorrência na mesma wallet', () => {
     expect(await reconcile(url, wallet.id)).toMatchObject({ consistent: true, storedBalance: { amount: '90.00' }, checkedEntries: 2 });
   });
 
-  test('cenário obrigatório: 100.00 e duas apostas de 80.00 simultâneas', async () => {
-    const wallet = await openWallet(url, '100.00');
-    const payloads = [bet(wallet, '80.00'), bet(wallet, '80.00')];
-    const results = await Promise.all(payloads.map((p) => send(url, p)));
+  // repetido: uma corrida que só falha às vezes não passa por sorte em uma execução
+  const C2_ROUNDS = 25;
+  test(`cenário obrigatório: 100.00 e duas apostas de 80.00 simultâneas (${C2_ROUNDS} rodadas)`, async () => {
+    for (let round = 0; round < C2_ROUNDS; round++) {
+      const wallet = await openWallet(url, '100.00');
+      const payloads = [bet(wallet, '80.00'), bet(wallet, '80.00')];
+      const results = await Promise.all(payloads.map((p) => send(url, p)));
 
-    expect(results.map((r) => r.body.status).sort()).toEqual(['PROCESSED', 'REJECTED']);
-    expect(results.find((r) => r.body.status === 'REJECTED')!.body.failureCode).toBe('INSUFFICIENT_FUNDS');
+      expect(results.map((r) => r.body.status).sort()).toEqual(['PROCESSED', 'REJECTED']);
+      expect(results.find((r) => r.body.status === 'REJECTED')!.body.failureCode).toBe('INSUFFICIENT_FUNDS');
 
-    // nenhum retry duplica o débito: reenviar as duas devolve as respostas originais
-    const retries = await Promise.all(payloads.map((p) => send(url, p)));
-    expect(retries.map((r) => ({ ...r.body, idempotentReplay: false }))).toEqual(results.map((r) => r.body));
+      // nenhum retry duplica o débito: reenviar as duas devolve as respostas originais
+      const retries = await Promise.all(payloads.map((p) => send(url, p)));
+      expect(retries.map((r) => ({ ...r.body, idempotentReplay: false }))).toEqual(results.map((r) => r.body));
 
-    const ledger = await call(url, 'GET', `/wallets/${wallet.id}/ledger`);
-    expect(ledger.body.items.filter((e: any) => e.direction === 'DEBIT')).toHaveLength(1);
-    expect(await reconcile(url, wallet.id)).toMatchObject({ consistent: true, storedBalance: { amount: '20.00' } });
-  });
+      const ledger = await call(url, 'GET', `/wallets/${wallet.id}/ledger`);
+      expect(ledger.body.items.filter((e: any) => e.direction === 'DEBIT')).toHaveLength(1);
+      expect(await reconcile(url, wallet.id)).toMatchObject({ consistent: true, storedBalance: { amount: '20.00' } });
+    }
+  }, 30_000);
 
   test('hot wallet: 30 apostas diferentes de 5.00 sobre 100.00 → exatamente 20 passam', async () => {
     const wallet = await openWallet(url, '100.00');
