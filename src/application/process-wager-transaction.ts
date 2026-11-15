@@ -159,7 +159,7 @@ export class ProcessWagerTransaction {
     const now = new Date();
     const transaction = newTransaction(command, payloadHash, now);
     const reference = command.referenceExternalTransactionId
-      ? await repo.findByExternalId(command.providerId, command.referenceExternalTransactionId)
+      ? await repo.findReference(command.providerId, command.walletId, command.referenceExternalTransactionId)
       : undefined;
     const decision = applyWager({
       wallet,

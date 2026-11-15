@@ -41,6 +41,12 @@ export interface WagerStore {
   /** Transação já gravada com a mesma idempotency key ou o mesmo id externo do provider. */
   findExisting(providerId: string, idempotencyKey: string, externalTransactionId: string): Promise<RecordedWager | undefined>;
   findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
+  /**
+   * Referência de uma reversão: a do próprio provider (regra 2). Sem ela, uma transação de outro provider com
+   * esse id externo na mesma wallet — o provider apontou para a transação errada, e a regra 2 a recusa já
+   * (REFERENCE_MISMATCH) em vez de deixar em PENDING_REFERENCE até o TTL.
+   */
+  findReference(providerId: string, walletId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
   /** Regra 4: a referência já tem um REFUND ou ROLLBACK PROCESSED (de qualquer tipo)? */
   isReversed(referenceTransactionId: string): Promise<boolean>;
   insertTransaction(transaction: WagerTransaction, observedBalance: Money, correlationId: string): Promise<void>;

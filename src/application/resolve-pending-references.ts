@@ -89,7 +89,7 @@ export class ResolvePendingReferences {
     if (!wallet || !pending || pending.nextAttemptAt?.getTime() !== claimedUntil.getTime()) return undefined;
 
     const { transaction } = pending;
-    const reference = await repo.findByExternalId(transaction.providerId, transaction.referenceExternalTransactionId!);
+    const reference = await repo.findReference(transaction.providerId, transaction.walletId, transaction.referenceExternalTransactionId!);
     let decision: WagerDecision = applyWager({
       wallet,
       transaction,

@@ -66,6 +66,13 @@ export class WagerRepository implements WagerStore {
     return row ? map.toWagerTransaction(row) : undefined;
   }
 
+  async findReference(providerId: string, walletId: string, externalTransactionId: string): Promise<WagerTransaction | undefined> {
+    const own = await this.findByExternalId(providerId, externalTransactionId);
+    if (own) return own;
+    const other = await this.em.findOne(WagerTransactionEntity, { walletId, externalTransactionId, providerId: { $ne: providerId } });
+    return other ? map.toWagerTransaction(other) : undefined;
+  }
+
   /** Regra 4: a referência já tem um REFUND ou ROLLBACK PROCESSED (de qualquer tipo)? */
   async isReversed(referenceTransactionId: string): Promise<boolean> {
     const count = await this.em.count(WagerTransactionEntity, {

@@ -8,12 +8,14 @@ import { LedgerEntryEntity, OutboxMessageEntity, WagerTransactionEntity } from '
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { WagerTransactionKind, WagerTransactionStatus } from '../../src/domain/wager-transaction';
 import * as api from '../support/api-client';
-import { corruptBalance, freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
+import { checkLedgerInvariantAfterEach, corruptBalance, freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
 
 let app: INestApplication;
 let orm: MikroORM;
 let url: string;
 let env: Env;
+const corrupted: string[] = []; // adulteradas de propósito pelo teste de reconciliação
+checkLedgerInvariantAfterEach(() => env, () => corrupted);
 
 beforeAll(async () => {
   env = await freshTestDatabase('api', true);
@@ -141,6 +143,16 @@ describe('POST /wagering/transactions', () => {
     const res = await submit(wallet, 'REFUND', '10.00', { referenceExternalTransactionId: 'bet-que-ainda-nao-chegou' });
     expect(res.status).toBe(202);
     expect(res.body).toMatchObject({ status: 'PENDING_REFERENCE', balance: { amount: '100.00' } });
+  });
+
+  test('regra 2: REFUND apontando para a BET de outro provider na mesma wallet → 422 REFERENCE_MISMATCH já, sem esperar', async () => {
+    const wallet = await openWallet();
+    const bet = await submit(wallet, 'BET', '10.00'); // provider-a
+    const refund = await submit(wallet, 'REFUND', '10.00', {
+      providerId: 'provider-b', referenceExternalTransactionId: bet.payload.externalTransactionId,
+    });
+    expect(refund.status).toBe(422);
+    expect(refund.body).toMatchObject({ status: 'REJECTED', failureCode: 'REFERENCE_MISMATCH', balance: { amount: '90.00' } });
   });
 
   test('BET → WIN → REFUND → ROLLBACK do WIN: saldo e ledger batem', async () => {
@@ -344,6 +356,7 @@ describe('consultas', () => {
     // o schema recusa a adulteração direta (migration 7)...
     await expect(orm.em.getConnection().execute(`update wallets set balance = 90 where id = ?`, [wallet.id])).rejects.toThrow('does not match');
     // ...então adultera contornando o banco (trigger desligado), o caso que a reconciliação existe para pegar
+    corrupted.push(wallet.id);
     await corruptBalance(env, wallet.id, '90.00');
     const rec = await call('POST', `/wallets/${wallet.id}/reconciliation`);
     expect(rec.body).toMatchObject({
