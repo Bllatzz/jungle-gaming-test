@@ -29,12 +29,31 @@ export async function freshTestDatabase(suite: string, migrate = false): Promise
   return testEnv;
 }
 
-/** Invariante final (§13) de uma vez, para o banco inteiro da suíte: wallets cujo saldo ≠ saldo reconstruído pelo ledger. */
+/**
+ * Invariante final (§13) de uma vez, para o banco inteiro da suíte: wallets cujo saldo ≠ saldo reconstruído
+ * pelo ledger, ou ≠ saldo da conta da wallet nas partidas dobradas.
+ */
 export async function walletsDivergingFromLedger(orm: MikroORM): Promise<{ id: string; balance: string }[]> {
   return orm.em.fork().getConnection().execute(`
     select w.id, w.balance::text as balance
     from wallets w
-    left join wallet_ledger_entries l on l.wallet_id = w.id
-    group by w.id
-    having w.balance <> coalesce(sum(case l.direction when 'CREDIT' then l.amount else -l.amount end), 0)`);
+    left join (select wallet_id, sum(case direction when 'CREDIT' then amount else -amount end) as net
+                 from wallet_ledger_entries group by wallet_id) l on l.wallet_id = w.id
+    left join (select account, sum(case direction when 'CREDIT' then amount else -amount end) as net
+                 from ledger_postings group by account) p on p.account = 'wallet:' || w.id
+    where w.balance <> coalesce(l.net, 0) or w.balance <> coalesce(p.net, 0)`);
+}
+
+/**
+ * Corrompe o saldo de uma wallet "por fora", como um operador que contornou o banco: desliga o trigger que
+ * amarra saldo e ledger (migration 7) só nesta transação. É a única forma de produzir a divergência que a
+ * reconciliação e a auditoria precisam detectar.
+ */
+export async function corruptBalance(orm: MikroORM, walletId: string, balance: string): Promise<void> {
+  await orm.em.fork().transactional(async (em) => {
+    const run = (sql: string, params: unknown[] = []) => em.getConnection().execute(sql, params, 'run', em.getTransactionContext());
+    await run('alter table wallets disable trigger wallets_match_ledger');
+    await run('update wallets set balance = ? where id = ?', [balance, walletId]);
+    await run('alter table wallets enable trigger wallets_match_ledger');
+  });
 }
