@@ -14,6 +14,21 @@ const COUNTERS: Record<CounterName, string> = {
 const HISTOGRAMS: Record<HistogramName, string> = {
   wager_processing_duration_seconds: 'Latência do processamento de uma transação (inclui replay)',
 };
+/**
+ * Séries conhecidas, expostas com 0 desde o start: rate()/increase() e alertas funcionam logo após o deploy
+ * (uma série que só nasce no primeiro evento perde esse primeiro incremento).
+ */
+const STATUSES = ['PROCESSED', 'REJECTED', 'PENDING_REFERENCE', 'FAILED'];
+const INITIAL_SERIES: [CounterName, Labels[]][] = [
+  ['wager_transactions_total', ['http', 'sqs', 'pending_worker'].flatMap((source) => STATUSES.map((status) => ({ source, status })))],
+  ['wager_duplicates_total', [{ source: 'http' }, { source: 'sqs' }]],
+  ['wager_conflicts_total', ['IDEMPOTENCY_CONFLICT', 'MESSAGE_ID_CONFLICT'].map((code) => ({ code }))],
+  ['wager_lock_conflicts_total', ['lock_timeout', 'deadlock', 'idempotency_race'].map((type) => ({ type }))],
+  ['wager_retries_total', ['sqs_consumer', 'outbox', 'pending_reference'].map((component) => ({ component }))],
+  ['sqs_dead_lettered_total', ['RETRIES_EXHAUSTED', 'PROCESSING_FAILED', 'INVALID_MESSAGE', 'INVALID_MONEY', 'INVALID_TRANSACTION',
+    'WALLET_NOT_FOUND', 'MESSAGE_ID_CONFLICT', 'IDEMPOTENCY_CONFLICT'].map((error_code) => ({ error_code }))],
+  ['reconciliation_divergences_total', [{}]],
+];
 const BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
 
 export type { CounterName, HistogramName };
@@ -28,6 +43,10 @@ type Histogram = { buckets: number[]; sum: number; count: number };
 export class Metrics implements MetricsRecorder {
   private readonly counters = new Map<CounterName, Map<string, number>>();
   private readonly histograms = new Map<HistogramName, Map<string, Histogram>>();
+
+  constructor() {
+    for (const [name, series] of INITIAL_SERIES) for (const labels of series) this.inc(name, labels, 0);
+  }
 
   inc(name: CounterName, labels: Labels = {}, by = 1): void {
     const series = this.counters.get(name) ?? new Map<string, number>();

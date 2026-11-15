@@ -3,15 +3,15 @@ import { randomUUID } from 'node:crypto';
 import { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
 import { createApp } from '../../src/bootstrap';
+import { ReconcileWallet } from '../../src/application/reconcile-wallet';
 import { ResolvePendingReferences } from '../../src/application/resolve-pending-references';
 import { OutboxPublisher } from '../../src/infrastructure/messaging/outbox-publisher';
 import { WagerRepository } from '../../src/infrastructure/persistence/wager.repository';
 import { WagerConsumer } from '../../src/infrastructure/messaging/wager-consumer';
-import { WalletEntity } from '../../src/infrastructure/persistence/entities';
 import { JsonLogger } from '../../src/infrastructure/observability/json-logger';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import * as api from '../support/api-client';
-import { freshTestDatabase } from '../support/test-database';
+import { corruptBalance, freshTestDatabase } from '../support/test-database';
 import { freshTestQueues } from '../support/test-queues';
 
 // /metrics e logs JSON com o app real (Postgres + LocalStack). Cada teste olha a diferença que ele causou.
@@ -167,10 +167,17 @@ describe('métricas', () => {
 
   test('divergência de reconciliação: sinalizada, logada e contada (nunca corrigida)', async () => {
     const wallet = await api.openWallet(url, '100.00');
-    await orm.em.fork().nativeUpdate(WalletEntity, { id: wallet.id }, { balance: '90.00' }); // corrompe o saldo
+    await corruptBalance(orm, wallet.id, '90.00'); // corrompe o saldo contornando o banco
     expect(await api.reconcile(url, wallet.id)).toMatchObject({ consistent: false });
     expect((await scrape()).value('reconciliation_divergences_total')).toBe(1);
     expect(logs.some((l) => l.level === 'error' && l.msg === 'wallet balance diverges from ledger' && l.walletId === wallet.id)).toBe(true);
+
+    // a auditoria periódica (worker) acha a mesma wallet sozinha, sem ninguém pedir a reconciliação
+    expect(await app.get(ReconcileWallet).sweep()).toBe(1);
+    expect((await scrape()).value('reconciliation_divergences_total')).toBe(2);
+    expect(logs.some((l) => l.msg === 'wallet balance diverges from ledger (sweep)' && l.walletId === wallet.id
+      && l.ledgerBalance === '100.00' && l.postingsBalance === '100.00')).toBe(true);
+    expect((await api.call(url, 'GET', `/wallets/${wallet.id}`)).body.balance.amount).toBe('90.00'); // nunca corrige
   });
 
   test('banco fora do ar: /metrics responde os contadores sem os gauges do banco', async () => {
@@ -183,6 +190,11 @@ describe('métricas', () => {
       const text = await res.text();
       expect(text).toContain('# TYPE wager_transactions_total counter');
       expect(text).not.toContain('outbox_lag_seconds');
+      // instância recém-subida: contadores já existem com 0 (rate()/alertas desde o deploy)
+      for (const series of ['wager_transactions_total{source="http",status="PROCESSED"}', 'wager_duplicates_total{source="sqs"}',
+        'sqs_dead_lettered_total{error_code="RETRIES_EXHAUSTED"}', 'wager_lock_conflicts_total{type="lock_timeout"}', 'reconciliation_divergences_total']) {
+        expect(text.split('\n')).toContain(`${series} 0`);
+      }
     } finally {
       await down.close();
       captureLogs();
