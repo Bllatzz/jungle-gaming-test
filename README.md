@@ -151,4 +151,5 @@ cada execução, e filas FIFO próprias por execução: nunca tocam o banco nem 
 - O Postgres usa a porta **5434** do host para não colidir com instalações locais.
 - Dois roles no banco: `wagering` (dono das tabelas, `MIGRATION_DATABASE_URL`, só migrations) e
   `wagering_app` (`DATABASE_URL`, o app), sem ownership e sem `UPDATE`/`DELETE`/`TRUNCATE` no ledger.
-  Os roles nascem no init do volume do Postgres: num volume antigo, rode `bun run infra:down && bun run infra:up`.
+  Os roles nascem no init do volume e são reaplicados (idempotente) pelo serviço `roles` a cada `bun run infra:up`
+  ou `docker compose up`: um volume antigo não precisa ser recriado.

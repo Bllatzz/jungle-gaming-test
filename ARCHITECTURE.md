@@ -2,6 +2,17 @@
 
 Decisões, trade-offs e limitações do Distributed Wagering Processor.
 
+## Leitura rápida
+
+O resto deste documento detalha cada ponto; para uma visão de uma tela, basta isto:
+
+- **Dinheiro:** `Money` sobre `decimal.js`, string com exatamente 2 casas na entrada, `numeric(20,2)` no banco. Ver [Money](#money).
+- **Concorrência:** `SELECT … FOR UPDATE` por wallet, com `lock_timeout` de 5 s → 503. Sem lock global. Ver [Processamento](#processamento-de-uma-transação-srcapplication).
+- **Idempotência:** `UNIQUE (provider_id, idempotency_key)` e `(provider_id, external_transaction_id)`, hash SHA-256 do payload canônico, replay com o saldo da época. Ver [Idempotência](#idempotência).
+- **Garantias no banco:** CHECKs, FKs compostas, ledger imutável por trigger e saldo == ledger checado no commit. O app conecta com um role sem ownership. Ver [Schema](#schema-e-garantias-no-banco).
+- **Mensageria:** inbox `(consumer_name, message_id)` na mesma transação do efeito. Outbox publicada depois do commit, em ordem estrita por wallet (sequência do banco, não relógio), com lease e `SKIP LOCKED`. Ver [Mensageria](#mensageria-e-workers).
+- **Fora de ordem:** REFUND/ROLLBACK sem referência ficam `PENDING_REFERENCE`, e um worker com backoff resolve ou expira em `REFERENCE_NOT_FOUND`. Ver [Referências fora de ordem](#referências-fora-de-ordem-71).
+
 ## Visão geral
 
 Serviço NestJS que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK) recebidas
@@ -344,12 +355,24 @@ lista é uma migration simples, sem `ALTER TYPE`).
 | Transação é auditável | trigger: linha terminal não muda; nenhuma linha é apagada; campos do payload (os que entram no `payload_hash`) nunca mudam |
 | Status coerente com os campos | `processed_at` ⇔ `PROCESSED`; `failure_code` ⇔ `REJECTED`/`FAILED` |
 | Inbox deduplica | `PRIMARY KEY (consumer_name, message_id)` |
+| Replay devolve o saldo daquele momento (regra 7) | `observed_balance` obrigatório em `PROCESSED`/`REJECTED` |
+
+`wager_transactions` **não** tem FK de moeda nem de player com a wallet de propósito: uma transação
+rejeitada por `CURRENCY_MISMATCH` ou `WALLET_PLAYER_MISMATCH` precisa ficar gravada para auditoria.
+
+Índices além das constraints: `UNIQUE (wallet_id, wallet_version)` no ledger (histórico por
+cursor, uma versão = um lançamento), parcial `WHERE status = 'PENDING_REFERENCE'` para achar quem espera uma referência,
+parcial `WHERE published_at IS NULL` em `occurred_at` (lag da outbox), em
+`(next_attempt_at, occurred_at, id)` (claim do publisher, migration 4) e em `(aggregate_id, seq)` (cabeça de
+cada wallet no claim).
 
 ### Roles: migration × runtime
 
 O app **não** conecta como dono das tabelas. `wagering` (dono, `MIGRATION_DATABASE_URL`) só roda
 migrations; o app usa `wagering_app` (`DATABASE_URL`), membro do role de grupo `wagering_runtime`.
-Os dois logins nascem em `docker/postgres/init-roles.sql` (init do volume do Postgres) e os grants
+Os dois logins nascem em `docker/postgres/init-roles.sql`, idempotente: roda no init do volume e de novo
+pelo serviço `roles` do compose a cada `bun run infra:up` / `docker compose up` (antes do `migrate`), então um
+volume criado antes dele ganha os roles sem ser recriado. Em produção os logins viriam da infra (IaC). Os grants
 ficam na migration `Migration20261115130000`:
 
 - `wallets`, `wager_transactions`, `inbox_messages`, `outbox_messages`: `SELECT, INSERT, UPDATE`;
@@ -360,17 +383,12 @@ Sem ownership, o app não consegue `ALTER TABLE … DISABLE TRIGGER`: as garanti
 saldo == ledger) não dependem de um role que poderia desligá-las. Um bug ou injeção de SQL no app recebe
 `permission denied` / `must be owner` (testado em `schema.test.ts` conectando como o role do app). Os testes
 de integração e concorrência rodam o app com esse role; só helpers que precisam contornar o banco de
-propósito (`corruptBalance`) conectam como dono. Num volume criado antes deste init script, recrie a infra
-(`bun run infra:down && bun run infra:up`).
-| Replay devolve o saldo daquele momento (regra 7) | `observed_balance` obrigatório em `PROCESSED`/`REJECTED` |
+propósito (`corruptBalance`) conectam como dono.
 
-`wager_transactions` **não** tem FK de moeda nem de player com a wallet de propósito: uma transação
-rejeitada por `CURRENCY_MISMATCH` ou `WALLET_PLAYER_MISMATCH` precisa ficar gravada para auditoria.
-
-Índices além das constraints: `UNIQUE (wallet_id, wallet_version)` no ledger (histórico por
-cursor, uma versão = um lançamento), parcial `WHERE status = 'PENDING_REFERENCE'` para achar quem espera uma referência,
-parcial `WHERE published_at IS NULL` em `occurred_at` (lag da outbox) e em
-`(next_attempt_at, occurred_at, id)` (claim do publisher, migration 4).
+Tabela nova de migration futura: `ALTER DEFAULT PRIVILEGES` (migration `Migration20261115150000`) já dá
+`SELECT, INSERT` (e `USAGE, SELECT` nas sequências) ao `wagering_runtime`. O padrão é append-only: `UPDATE`
+e `DELETE` continuam pedindo grant explícito na migration que cria a tabela (testado com uma tabela criada
+pelo dono depois das migrations).
 
 ### Partidas dobradas (`ledger_postings`, migration 5)
 
@@ -617,7 +635,7 @@ Uma regra só decide o destino da mensagem: **ack quando o desfecho está no ban
 Cada volta em três passos curtos (claim → commit → publish → mark):
 
 1. **Reserva (lease):** trava com `FOR UPDATE SKIP LOCKED` até 50 "cabeças" vencidas — o evento mais
-   antigo ainda não publicado de cada wallet —, reserva (`next_attempt_at = agora + 30 s`) até 50 eventos
+   antigo ainda não publicado de cada wallet, pela ordem de `seq` —, reserva (`next_attempt_at = agora + 30 s`) até 50 eventos
    vencidos dessas wallets e **commita**. O lock dura só essa transação.
 2. `SendMessageBatch` **fora de transação**, em lotes de 10 (limite do SQS), com os eventos de cada
    wallet juntos e em ordem (`MessageGroupId = walletId`, `MessageDeduplicationId = eventId`). Lotes de
@@ -642,13 +660,20 @@ Cada volta em três passos curtos (claim → commit → publish → mark):
   duplicata segura (mesmo `MessageDeduplicationId`). Teste: SQS que aceita a conexão e nunca responde.
 - Busca das vencidas pelo índice parcial `outbox_due_idx (next_attempt_at, occurred_at, id) WHERE
   published_at IS NULL`: com o SQS fora, as pendentes em backoff não são lidas a cada volta.
-- **Ordem por wallet é estrita.** Uma wallet só entra numa reserva se a cabeça dela estiver vencida e
+- **Ordem por wallet é estrita, e não depende de relógio.** A ordem é a de `outbox_messages.seq`, uma
+  sequência do banco (identity) sorteada no INSERT do evento. O INSERT acontece com a wallet travada
+  (`FOR UPDATE`), então o evento seguinte da mesma wallet só é gravado depois do commit do anterior e recebe
+  um `seq` maior, mesmo vindo de outra instância com o relógio atrasado. `occurred_at` (relógio do app) fica
+  só no envelope e na métrica de lag; ordenar por ele quebrava a ordem com relógios divergentes ou com dois
+  eventos no mesmo milissegundo em processos diferentes (UUIDv7 só é monotônico dentro do processo). Teste:
+  eventos gravados com `occurred_at` decrescente saem do claim na ordem de gravação (`schema.test.ts`).
+  Uma wallet só entra numa reserva se a cabeça dela estiver vencida e
   livre; enquanto um publisher tem a cabeça (reservada, ou em backoff depois de uma recusa), nenhum outro
   pega eventos posteriores da mesma wallet. Na volta, uma recusa do SQS segura o resto da série daquela
   wallet (vai junto para o retry). Única brecha: o SQS recusar uma entrada no meio de um lote e aceitar as
   seguintes da mesma wallet no mesmo lote. A garantia final continua no banco (§8: a ordem do broker é
   otimização), e o consumidor deduplica por `eventId`. Teste: dois publishers, wallets com mais de um
-  lote de eventos, e a ordem de chegada na FIFO bate com a ordem de gravação na outbox.
+  lote de eventos, e a ordem de chegada na FIFO bate com a ordem de gravação na outbox (`seq`).
 
 ### Referências fora de ordem (§7.1)
 
