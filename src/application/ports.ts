@@ -1,9 +1,8 @@
-import type { FailureCode } from '../domain/failure-codes';
 import type { InboxMessage } from '../domain/inbox-message';
 import type { WalletLedgerEntry } from '../domain/ledger-entry';
 import type { Money } from '../domain/money';
 import type { OutboxMessage } from '../domain/outbox-message';
-import type { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../domain/wager-transaction';
+import type { WagerTransaction } from '../domain/wager-transaction';
 import type { Wallet } from '../domain/wallet';
 
 /**
@@ -14,15 +13,9 @@ import type { Wallet } from '../domain/wallet';
 
 /** O que já está gravado de uma transação: o suficiente para decidir entre replay e conflito. */
 export interface RecordedWager {
-  id: string;
-  providerId: string;
-  externalTransactionId: string;
-  idempotencyKey: string;
-  payloadHash: string;
-  status: WagerTransactionStatus;
-  failureCode?: FailureCode | null;
+  transaction: WagerTransaction;
   /** Saldo da wallet quando a transação foi decidida (regra 7). */
-  observedBalance?: string | null;
+  observedBalance: string | null;
 }
 
 /** Uma PENDING_REFERENCE com a agenda do worker (§7.1). */
@@ -30,20 +23,27 @@ export interface PendingReference {
   transaction: WagerTransaction;
   attempts: number;
   nextAttemptAt: Date | null;
+  /** correlationId de quem enviou a transação (null em linhas anteriores à migration 6). */
+  correlationId: string | null;
 }
 
 /** Leitura e escrita dentro de uma transação SQL só (ver UnitOfWork). */
 export interface WagerStore {
   /** Trava a wallet até o commit: nenhuma outra transação, em nenhuma instância, mexe nela. */
   lockWallet(id: string): Promise<Wallet | undefined>;
-  insertWallet(wallet: Wallet): Promise<void>;
+  /** Leitura sem lock (o que já está commitado): para o replay, que não muda nada. */
+  findWallet(id: string): Promise<Wallet | undefined>;
+  /** `open`: Idempotency-Key e hash do pedido de abertura, quando o cliente mandou a key. */
+  insertWallet(wallet: Wallet, open?: { idempotencyKey: string; payloadHash: string }): Promise<void>;
+  /** Wallet aberta com esta Idempotency-Key, com o hash do pedido original. */
+  findWalletByOpenKey(idempotencyKey: string): Promise<{ wallet: Wallet; payloadHash: string } | undefined>;
   saveWallet(wallet: Wallet): Promise<void>;
   /** Transação já gravada com a mesma idempotency key ou o mesmo id externo do provider. */
   findExisting(providerId: string, idempotencyKey: string, externalTransactionId: string): Promise<RecordedWager | undefined>;
   findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
-  /** Regra 4: a referência já foi revertida por uma transação PROCESSED do mesmo kind? */
-  isReversedBySameKind(referenceTransactionId: string, kind: WagerTransactionKind): Promise<boolean>;
-  insertTransaction(transaction: WagerTransaction, observedBalance: Money): Promise<void>;
+  /** Regra 4: a referência já tem um REFUND ou ROLLBACK PROCESSED (de qualquer tipo)? */
+  isReversed(referenceTransactionId: string): Promise<boolean>;
+  insertTransaction(transaction: WagerTransaction, observedBalance: Money, correlationId: string): Promise<void>;
   appendLedgerEntry(entry: WalletLedgerEntry, walletVersion: number): Promise<void>;
   enqueue(messages: OutboxMessage[]): Promise<void>;
   findInbox(consumerName: string, messageId: string): Promise<{ payloadHash: string } | undefined>;
@@ -68,6 +68,8 @@ export interface WagerStore {
  */
 export abstract class UnitOfWork {
   abstract transaction<T>(work: (store: WagerStore) => Promise<T>): Promise<T>;
+  /** Falha que passa sozinha (banco fora, lock timeout): vale tentar de novo sem contar como erro do dado. */
+  abstract isTransient(error: unknown): boolean;
 }
 
 export type CounterName =
@@ -85,9 +87,21 @@ export abstract class MetricsRecorder {
   abstract observe(name: HistogramName, labels: Record<string, string>, seconds: number): void;
 }
 
+/**
+ * Log estruturado (JSON, um objeto por linha). O Logger do Nest já tem essa forma; a aplicação só conhece a
+ * interface — cada use case recebe o seu, com o próprio nome como contexto (app.module.ts).
+ */
+export interface AppLogger {
+  log(entry: Record<string, unknown>): void;
+  warn(entry: Record<string, unknown>): void;
+  error(entry: Record<string, unknown>): void;
+}
+
 /** Saldo gravado e somas do ledger lidos na mesma foto do banco. */
 export abstract class ReconciliationSource {
   abstract reconciliationSnapshot(walletId: string): Promise<
     { wallet: Wallet; credits: string; debits: string; entries: number } | undefined
   >;
+  /** Varredura do banco inteiro: wallets cujo saldo ≠ Σ ledger ou ≠ conta da wallet nas partidas dobradas. */
+  abstract divergingWallets(): Promise<{ walletId: string; balance: string; ledgerBalance: string; postingsBalance: string }[]>;
 }
