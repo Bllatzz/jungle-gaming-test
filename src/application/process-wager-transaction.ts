@@ -1,4 +1,3 @@
-import { Injectable, Logger } from '@nestjs/common';
 import type { FailureCode } from '../domain/failure-codes';
 import { InboxMessage } from '../domain/inbox-message';
 import { Money } from '../domain/money';
@@ -8,7 +7,7 @@ import type { Wallet } from '../domain/wallet';
 import { ConflictError, NotFoundError, UniqueViolationError } from './errors';
 import type { RequestContext } from './event-context';
 import { type WagerPayload, wagerPayloadHash } from './payload-hash';
-import { MetricsRecorder, type RecordedWager, UnitOfWork, type WagerStore } from './ports';
+import type { AppLogger, MetricsRecorder, RecordedWager, UnitOfWork, WagerStore } from './ports';
 import { recordDecision } from './wager-outcome';
 
 export interface WagerCommand extends WagerPayload {
@@ -44,13 +43,11 @@ const MAX_ATTEMPTS = 3;
  * Processa uma transação de aposta — o mesmo caminho para HTTP e SQS.
  * Tudo numa transação SQL: lock da wallet, idempotência, regras, transação, ledger, saldo e outbox.
  */
-@Injectable()
 export class ProcessWagerTransaction {
-  private readonly logger = new Logger(ProcessWagerTransaction.name);
-
   constructor(
     private readonly uow: UnitOfWork,
     private readonly metrics: MetricsRecorder,
+    private readonly logger: AppLogger,
   ) {}
 
   async execute(command: WagerCommand, request: RequestContext, inbox?: InboxEntry): Promise<WagerResult> {
@@ -106,12 +103,40 @@ export class ProcessWagerTransaction {
     }
   }
 
+  /**
+   * Replay sem o lock da wallet: uma transação terminal nunca muda (trigger no banco), então a resposta lida
+   * do que já está commitado é a mesma que sairia sob o lock — e reenvios numa hot wallet não entram na fila
+   * do lock. PENDING_REFERENCE (pode estar sendo resolvida agora) e mensagem de fila ainda não vista no inbox
+   * (precisa ser registrada junto) seguem pelo caminho com lock.
+   */
+  private async replayWithoutLock(
+    repo: WagerStore, command: WagerCommand, payloadHash: string, inbox: InboxEntry | undefined,
+  ): Promise<WagerResult | undefined> {
+    const existing = await repo.findExisting(command.providerId, command.idempotencyKey, command.externalTransactionId);
+    if (!existing || !existing.transaction.isTerminal()) return undefined;
+    if (inbox) {
+      const seen = await repo.findInbox(inbox.consumerName, inbox.messageId);
+      if (!seen || seen.payloadHash !== payloadHash) return undefined; // conflito ou registro: caminho com lock decide
+    }
+    const wallet = await repo.findWallet(command.walletId);
+    if (!wallet) return undefined;
+    return replay(existing, command.idempotencyKey, payloadHash, wallet);
+  }
+
   private async process(
     repo: WagerStore, command: WagerCommand, payloadHash: string, request: RequestContext, inbox: InboxEntry | undefined,
   ): Promise<WagerResult> {
+    const fast = await this.replayWithoutLock(repo, command, payloadHash, inbox);
+    if (fast) return fast;
+
     // 1. Lock da wallet: serializa tudo desta wallet, em qualquer instância.
     const wallet = await repo.lockWallet(command.walletId);
-    if (!wallet) throw NotFoundError.wallet(command.walletId);
+    if (!wallet) {
+      // a key já gravada com outra wallet é conflito de idempotência (409), não wallet errada (404)
+      const existing = await repo.findExisting(command.providerId, command.idempotencyKey, command.externalTransactionId);
+      if (existing) throw idempotencyConflict(existing.transaction);
+      throw NotFoundError.wallet(command.walletId);
+    }
 
     // Inbox: mensagem já vista → segue para o replay abaixo; vista pela primeira vez → registra, junto com o efeito.
     if (inbox) {
@@ -140,13 +165,13 @@ export class ProcessWagerTransaction {
       wallet,
       transaction,
       reference,
-      referenceAlreadyReversedBySameKind: reference ? await repo.isReversedBySameKind(reference.id, transaction.kind) : false,
+      referenceAlreadyReversed: reference ? await repo.isReversed(reference.id) : false,
       ledgerEntryId: Bun.randomUUIDv7(),
       now,
     });
 
     // 4. Grava tudo: transação → lançamento → saldo → eventos (ordem das FKs).
-    await repo.insertTransaction(transaction, wallet.balance);
+    await repo.insertTransaction(transaction, wallet.balance, request.correlationId);
     await recordDecision(repo, transaction, wallet, decision, request, now);
 
     return {
@@ -178,23 +203,28 @@ function newTransaction(command: WagerCommand, payloadHash: string, now: Date): 
   });
 }
 
+function idempotencyConflict(transaction: WagerTransaction): ConflictError {
+  return new ConflictError(
+    'IDEMPOTENCY_CONFLICT',
+    `Transação ${transaction.externalTransactionId} do provider ${transaction.providerId} já existe com outro payload ou outra idempotency key`,
+  );
+}
+
 /**
  * Mesma key + mesmo payload → o resultado gravado. Qualquer outra coincidência → conflito, não replay.
  * Devolve o estado atual da transação: uma PENDING_REFERENCE resolvida depois responde com o desfecho.
  */
 function replay(existing: RecordedWager, idempotencyKey: string, payloadHash: string, wallet: Wallet): WagerResult {
-  if (existing.idempotencyKey !== idempotencyKey || existing.payloadHash !== payloadHash) {
-    throw new ConflictError(
-      'IDEMPOTENCY_CONFLICT',
-      `Transação ${existing.externalTransactionId} do provider ${existing.providerId} já existe com outro payload ou outra idempotency key`,
-    );
+  const { transaction } = existing;
+  if (transaction.idempotencyKey !== idempotencyKey || !transaction.matchesPayload(payloadHash)) {
+    throw idempotencyConflict(transaction);
   }
   // toda transação gravada por este use case tem saldo observado; sem ele, a regra 7 não tem como ser cumprida
-  if (existing.observedBalance == null) throw new Error(`Transação ${existing.id} sem saldo observado`);
+  if (existing.observedBalance == null) throw new Error(`Transação ${transaction.id} sem saldo observado`);
   return {
-    transactionId: existing.id,
-    status: existing.status,
-    failureCode: existing.failureCode ?? undefined,
+    transactionId: transaction.id,
+    status: transaction.status,
+    failureCode: transaction.failureCode,
     balance: Money.from({ amount: existing.observedBalance, currency: wallet.currency }),
     idempotentReplay: true,
   };

@@ -6,9 +6,9 @@ import { createApp } from '../../src/bootstrap';
 import type { Env } from '../../src/config/env';
 import { LedgerEntryEntity, OutboxMessageEntity, WagerTransactionEntity } from '../../src/infrastructure/persistence/entities';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
-import { WagerTransactionStatus } from '../../src/domain/wager-transaction';
+import { WagerTransactionKind, WagerTransactionStatus } from '../../src/domain/wager-transaction';
 import * as api from '../support/api-client';
-import { freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
+import { corruptBalance, freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
 
 let app: INestApplication;
 let orm: MikroORM;
@@ -104,6 +104,14 @@ describe('POST /wagering/transactions', () => {
     expect(conflict.body.error).toBe('IDEMPOTENCY_CONFLICT');
   });
 
+  test('mesma key com walletId trocado para um inexistente → 409, não 404', async () => {
+    const wallet = await openWallet();
+    const first = await submit(wallet, 'BET', '25.00');
+    const conflict = await send({ ...first.payload, walletId: randomUUID() });
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.error).toBe('IDEMPOTENCY_CONFLICT');
+  });
+
   test('mesmo id externo com outra key → 409', async () => {
     const wallet = await openWallet();
     const first = await submit(wallet, 'BET', '25.00');
@@ -149,6 +157,46 @@ describe('POST /wagering/transactions', () => {
     expect(rec.body).toMatchObject({ consistent: true, checkedEntries: 5, difference: { amount: '0.00' } });
   });
 
+  test('regra 4: REFUND e depois ROLLBACK da mesma BET → o segundo é rejeitado, a aposta volta uma vez só', async () => {
+    const wallet = await openWallet('150.00');
+    const bet = await submit(wallet, 'BET', '30.00');
+    const ref = { referenceExternalTransactionId: bet.payload.externalTransactionId };
+    expect((await submit(wallet, 'REFUND', '30.00', ref)).body).toMatchObject({ status: 'PROCESSED', balance: { amount: '150.00' } });
+    const rollback = await submit(wallet, 'ROLLBACK', '30.00', ref);
+    expect(rollback.status).toBe(422);
+    expect(rollback.body).toMatchObject({ status: 'REJECTED', failureCode: 'REFERENCE_ALREADY_REVERSED', balance: { amount: '150.00' } });
+    expect((await call('GET', `/wallets/${wallet.id}`)).body.balance.amount).toBe('150.00'); // antes: 180.00
+  });
+
+  test('WIN sobre BET já reembolsada → 422 REFERENCE_ALREADY_REVERSED, sem pagar o prêmio', async () => {
+    const wallet = await openWallet('100.00');
+    const bet = await submit(wallet, 'BET', '10.00');
+    const ref = { referenceExternalTransactionId: bet.payload.externalTransactionId };
+    await submit(wallet, 'REFUND', '10.00', ref);
+    const win = await submit(wallet, 'WIN', '50.00', ref);
+    expect(win.status).toBe(422);
+    expect(win.body).toMatchObject({ failureCode: 'REFERENCE_ALREADY_REVERSED', balance: { amount: '100.00' } });
+  });
+
+  test('replay de transação decidida não espera o lock da wallet (hot wallet)', async () => {
+    const wallet = await openWallet();
+    const bet = await submit(wallet, 'BET', '1.00');
+    const holder = orm.em.fork();
+    await holder.begin();
+    await holder.getConnection().execute('select 1 from wallets where id = ? for update', [wallet.id], 'all', holder.getTransactionContext());
+    try {
+      const started = Date.now();
+      const replay = await send(bet.payload);
+      expect(replay.status).toBe(200);
+      expect(replay.body).toMatchObject({ idempotentReplay: true, transactionId: bet.body.transactionId });
+      expect(Date.now() - started).toBeLessThan(2_000); // com o lock seriam 5 s e 503
+      // payload divergente também responde sem o lock: 409
+      expect((await send({ ...bet.payload, money: { amount: '2.00', currency: 'BRL' } })).status).toBe(409);
+    } finally {
+      await holder.rollback();
+    }
+  }, 15_000);
+
   test('outbox: eventos gravados na mesma transação, um por fato', async () => {
     const wallet = await openWallet();
     const bet = await submit(wallet, 'BET', '10.00');
@@ -190,6 +238,37 @@ describe('POST /wagering/transactions', () => {
   test('wallet inexistente → 404', async () => {
     const res = await submit({ id: randomUUID(), playerId: 'p' }, 'BET', '1.00');
     expect(res.status).toBe(404);
+  });
+});
+
+describe('POST /wallets idempotente (Idempotency-Key)', () => {
+  test('reenvio com a mesma key devolve a mesma wallet (201) e não abre outra', async () => {
+    const key = `open-${randomUUID()}`;
+    const body = { playerId: randomUUID(), initialBalance: { amount: '50.00', currency: 'BRL' } };
+    const first = await call('POST', '/wallets', body, { 'idempotency-key': key });
+    expect(first.status).toBe(201);
+    await submit(first.body, 'BET', '10.00'); // o saldo muda depois da abertura
+    const again = await call('POST', '/wallets', body, { 'idempotency-key': key });
+    expect(again.status).toBe(201);
+    expect(again.body).toEqual(first.body); // a resposta original (saldo inicial), não o saldo de agora
+    expect(await orm.em.fork().count(WagerTransactionEntity, { walletId: first.body.id, kind: WagerTransactionKind.Opening })).toBe(1);
+  });
+
+  test('mesma key com outro pedido → 409 IDEMPOTENCY_CONFLICT; sem key, duplicata continua 409 WALLET_ALREADY_EXISTS', async () => {
+    const key = `open-${randomUUID()}`;
+    const body = { playerId: randomUUID(), initialBalance: { amount: '50.00', currency: 'BRL' } };
+    expect((await call('POST', '/wallets', body, { 'idempotency-key': key })).status).toBe(201);
+    const other = await call('POST', '/wallets', { ...body, initialBalance: { amount: '60.00', currency: 'BRL' } }, { 'idempotency-key': key });
+    expect(other).toMatchObject({ status: 409, body: { error: 'IDEMPOTENCY_CONFLICT' } });
+    expect((await call('POST', '/wallets', body)).body.error).toBe('WALLET_ALREADY_EXISTS');
+  });
+
+  test('reenvios simultâneos com a mesma key: uma wallet, todos recebem a mesma resposta', async () => {
+    const key = `open-${randomUUID()}`;
+    const body = { playerId: randomUUID(), initialBalance: { amount: '10.00', currency: 'BRL' } };
+    const responses = await Promise.all(Array.from({ length: 10 }, () => call('POST', '/wallets', body, { 'idempotency-key': key })));
+    expect(responses.map((r) => r.status)).toEqual(Array(10).fill(201));
+    expect(new Set(responses.map((r) => r.body.id)).size).toBe(1);
   });
 });
 
@@ -247,15 +326,23 @@ describe('consultas', () => {
     expect(versions).toEqual([1, 2, 3, 4, 5]);
     expect(page3.body.nextCursor).toBeNull();
     expect((await call('GET', `/wallets/${wallet.id}/ledger?cursor=lixo`)).status).toBe(400);
-    const huge = Buffer.from('99999999999').toString('base64url'); // não cabe no integer do Postgres
+    const huge = Buffer.from('99999999999').toString('base64url'); // formato antigo (versão em base64): não vale mais
     expect((await call('GET', `/wallets/${wallet.id}/ledger?cursor=${huge}`)).status).toBe(400);
+    // opaco: não revela a posição, e o cursor de uma wallet não serve em outra
+    expect(Buffer.from(page1.body.nextCursor, 'base64url').toString()).toBe(page1.body.items[1].id);
+    const other = await openWallet();
+    expect((await call('GET', `/wallets/${other.id}/ledger?cursor=${page1.body.nextCursor}`)).status).toBe(400);
+    const unknown = Buffer.from(randomUUID()).toString('base64url');
+    expect((await call('GET', `/wallets/${wallet.id}/ledger?cursor=${unknown}`)).status).toBe(400);
     expect((await call('GET', `/wallets/${wallet.id}/ledger?limit=0`)).status).toBe(400);
   });
 
   test('reconciliação sinaliza divergência sem corrigir', async () => {
     const wallet = await openWallet();
-    // adultera o saldo por fora (o ledger é imutável; a wallet não)
-    await orm.em.getConnection().execute(`update wallets set balance = 90 where id = ?`, [wallet.id]);
+    // o schema recusa a adulteração direta (migration 7)...
+    await expect(orm.em.getConnection().execute(`update wallets set balance = 90 where id = ?`, [wallet.id])).rejects.toThrow('does not match');
+    // ...então adultera contornando o banco (trigger desligado), o caso que a reconciliação existe para pegar
+    await corruptBalance(orm, wallet.id, '90.00');
     const rec = await call('POST', `/wallets/${wallet.id}/reconciliation`);
     expect(rec.body).toMatchObject({
       consistent: false, storedBalance: { amount: '90.00' }, calculatedBalance: { amount: '100.00' }, difference: { amount: '-10.00' },

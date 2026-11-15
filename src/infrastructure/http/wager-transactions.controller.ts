@@ -3,10 +3,10 @@ import type { Request, Response } from 'express';
 import { NotFoundError } from '../../application/errors';
 import { ProcessWagerTransaction } from '../../application/process-wager-transaction';
 import { WagerTransactionStatus } from '../../domain/wager-transaction';
-import type { WagerTransactionRow } from '../persistence/entities';
 import { WagerQueries } from '../persistence/wager.queries';
-import { transactionJson, wagerResultJson } from './presenters';
-import { AuthGuard } from './auth.guard';
+import { type TransactionView, transactionJson, wagerResultJson } from './presenters';
+import { annotateWager } from '../observability/tracing';
+import { AuthGuard, authenticatedProvider } from './auth.guard';
 import { requestContext } from './request-context';
 import { parseWagerCommand, text, uuid } from './request-parsing';
 
@@ -15,6 +15,9 @@ const STATUS_BY_RESULT: Partial<Record<WagerTransactionStatus, HttpStatus>> = {
   [WagerTransactionStatus.Processed]: HttpStatus.OK,
   [WagerTransactionStatus.Rejected]: HttpStatus.UNPROCESSABLE_ENTITY,
   [WagerTransactionStatus.PendingReference]: HttpStatus.ACCEPTED,
+  // só o replay chega aqui (o worker grava FAILED): desfecho terminal e gravado, sem efeito no saldo — como o
+  // REJECTED, não adianta reenviar. 422 e não 500, para não se confundir com um bug; o corpo diz FAILED.
+  [WagerTransactionStatus.Failed]: HttpStatus.UNPROCESSABLE_ENTITY,
 };
 
 @Controller()
@@ -32,14 +35,20 @@ export class WagerTransactionsController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const result = await this.processWager.execute(parseWagerCommand(body, idempotencyKey), requestContext(req));
+    const command = parseWagerCommand(body, idempotencyKey);
+    const request = requestContext(req);
+    const result = await this.processWager.execute(command, request);
+    annotateWager(command, result, request.correlationId);
     res.status(STATUS_BY_RESULT[result.status] ?? HttpStatus.INTERNAL_SERVER_ERROR);
     return wagerResultJson(result);
   }
 
   @Get('wagering/transactions/:transactionId')
-  async get(@Param('transactionId') transactionId: string) {
-    return this.present(await this.queries.transaction(uuid(transactionId, 'transactionId')));
+  async get(@Param('transactionId') transactionId: string, @Req() req: Request) {
+    const row = await this.queries.transaction(uuid(transactionId, 'transactionId'));
+    // com auth: transação de outro provedor responde como inexistente (não vaza que o id existe)
+    const provider = authenticatedProvider(req);
+    return this.present(provider === undefined || row?.providerId === provider ? row : undefined);
   }
 
   @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
@@ -49,7 +58,7 @@ export class WagerTransactionsController {
     );
   }
 
-  private async present(row: WagerTransactionRow | undefined) {
+  private async present(row: TransactionView | undefined) {
     if (!row) throw new NotFoundError('TRANSACTION_NOT_FOUND', 'Transação não encontrada');
     const wallet = await this.queries.wallet(row.walletId);
     return transactionJson(row, wallet!.currency); // FK garante que a wallet existe
