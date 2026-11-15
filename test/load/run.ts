@@ -20,6 +20,9 @@ const WALLETS = positiveInt('LOAD_WALLETS', 200);
 const PORTS = [39201, 39202, 39203];
 const urls = PORTS.map((p) => `http://localhost:${p}`);
 
+/** Maior que o saldo de qualquer wallet da carga (100000.00 + WINs): sempre rejeitada. */
+const REJECTED_AMOUNT = '1000000.00';
+
 const pick = <T>(items: T[]): T => items[Math.floor(Math.random() * items.length)]!;
 
 type Sample = { op: string; status: number; ms: number };
@@ -67,6 +70,7 @@ async function run() {
   const expectedCents = new Map<string, number>();
   const uncertain = new Set<string>();
   const samples: Sample[] = [];
+  let unexpectedRejections = 0; // rejected_bet que não voltou 422
   // NaN = amostra perdida (/metrics omite o gauge se a consulta passar de 2s): contada no relatório, não escondida
   const lag: number[] = [];
   let sampling = true;
@@ -81,7 +85,9 @@ async function run() {
     while (performance.now() < deadline) {
       const roll = Math.random();
       const [op, payload] =
-        roll < 0.6 ? ['bet', wagerPayload(pick(wallets), 'BET', '1.00')]
+        roll < 0.55 ? ['bet', wagerPayload(pick(wallets), 'BET', '1.00')]
+        // caminho de rejeição sob carga: aposta maior que qualquer saldo → 422 INSUFFICIENT_FUNDS, sem lançamento
+        : roll < 0.6 ? ['rejected_bet', wagerPayload(pick(wallets), 'BET', REJECTED_AMOUNT)]
         : roll < 0.75 ? ['hot_bet', wagerPayload(hot, 'BET', '1.00')]
         : roll < 0.85 ? ['win', wagerPayload(pick(wallets), 'WIN', '1.00')]
         : sent.length > 0 ? ['replay', pick(sent)] : ['bet', wagerPayload(pick(wallets), 'BET', '1.00')];
@@ -89,8 +95,11 @@ async function run() {
       const status = await post(pick(urls), payload); // 0 = falha de rede
       samples.push({ op, status, ms: performance.now() - t0 });
       if (op === 'replay') continue;
+      if (op === 'rejected_bet' && status !== 422) unexpectedRejections++;
       if (status === 200) {
-        const cents = payload.kind === 'BET' ? -100 : 100;
+        // centavos inteiros a partir da string ("1.00" → 100): nada de float para dinheiro
+        const amountCents = Number(payload.money.amount.replace('.', ''));
+        const cents = payload.kind === 'BET' ? -amountCents : amountCents;
         expectedCents.set(payload.walletId, (expectedCents.get(payload.walletId) ?? 0) + cents);
       }
       if (status === 200 || status === 422) sent.push(payload); // replay só do que já foi decidido
@@ -120,13 +129,17 @@ async function run() {
   const mismatched = checks.filter((c) => !c.balanceMatches).length;
 
   return {
-    consistent: inconsistent === 0 && mismatched === 0,
-    text: format({ samples, elapsedS, lag, drainS, before, after, inconsistent, mismatched, uncertain: uncertain.size, walletCount: checks.length }),
+    consistent: inconsistent === 0 && mismatched === 0 && unexpectedRejections === 0,
+    text: format({
+      samples, elapsedS, lag, drainS, before, after, inconsistent, mismatched, uncertain: uncertain.size, walletCount: checks.length,
+      unexpectedRejections,
+    }),
   };
 }
 
 function format(r: {
   samples: Sample[]; elapsedS: number; lag: number[]; drainS: number; inconsistent: number; mismatched: number; uncertain: number; walletCount: number;
+  unexpectedRejections: number;
   before: Record<string, number>; after: Record<string, number>;
 }): string {
   const delta = (name: string) => (r.after[name] ?? 0) - (r.before[name] ?? 0);
@@ -148,6 +161,7 @@ function format(r: {
     `- Latência (ms, cliente): p50 ${pct(all, 50)} · p95 ${pct(all, 95)} · p99 ${pct(all, 99)} · máx ${pct(all, 100)}`,
     `- Status HTTP: ${Object.entries(byStatus).map(([s, n]) => `${s === '0' ? 'rede' : s}=${n}`).join(', ')}`,
     `- Taxa de erro (5xx + rede): ${((errors / r.samples.length) * 100).toFixed(2)}%`,
+    `- Rejeições esperadas (rejected_bet → 422): ${r.samples.filter((s) => s.op === 'rejected_bet').length - r.unexpectedRejections} ok, ${r.unexpectedRejections} fora do esperado`,
     `- Conflitos de lock (lock_timeout/deadlock/corrida de idempotência): ${delta('wager_lock_conflicts_total')}`,
     `- Duplicatas detectadas (replays): ${delta('wager_duplicates_total')}`,
     `- Retries da outbox: ${delta('wager_retries_total{component="outbox"}')}`,
