@@ -8,20 +8,21 @@ import { MAX_REFERENCE_ATTEMPTS, ResolvePendingReferences } from '../../src/appl
 import { createApp } from '../../src/bootstrap';
 import type { Env } from '../../src/config/env';
 import { OutboxPublisher, SQS_TIMEOUT_MS } from '../../src/infrastructure/messaging/outbox-publisher';
-import { CONSUMER_NAME, MAX_RECEIVES, MAX_TRANSIENT_RECEIVES, WagerConsumer } from '../../src/infrastructure/messaging/wager-consumer';
+import { CONSUMER_NAME, MAX_RECEIVES, WagerConsumer } from '../../src/infrastructure/messaging/wager-consumer';
 import {
   InboxMessageEntity, LedgerEntryEntity, OutboxMessageEntity, WagerTransactionEntity,
 } from '../../src/infrastructure/persistence/entities';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { WagerRepository } from '../../src/infrastructure/persistence/wager.repository';
 import * as api from '../support/api-client';
-import { freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
+import { checkLedgerInvariantAfterEach, freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
 import { freshTestQueues } from '../support/test-queues';
 
 // Consumer, outbox e worker de referências contra Postgres e LocalStack reais. Workers desligados no app:
 // cada teste chama a volta que quer (pollOnce, publishPending, runOnce) — sem esperar timers.
 
 let env: Env;
+checkLedgerInvariantAfterEach(() => env);
 let queues: Awaited<ReturnType<typeof freshTestQueues>>;
 let app: INestApplication;
 let orm: MikroORM;
@@ -150,9 +151,10 @@ describe('consumer', () => {
     expect(await queues.drain('wager')).toEqual([]);
   }, 15_000); // até 5 voltas de long polling: os 5 s padrão estouraram com o LocalStack recém-subido
 
-  test(`transitório: retry com backoff e, só no ${MAX_TRANSIENT_RECEIVES}º recebimento, DLQ`, async () => {
+  test('transitório: retry com backoff sem limite de contagem; DLQ só depois do TTL desde o 1º recebimento', async () => {
+    const TTL_SECONDS = 15;
     // segunda instância com o banco fora do ar, nas mesmas filas
-    const down = await createApp({ ...env, databaseUrl: 'postgres://wagering:wagering@localhost:1/wagering' });
+    const down = await createApp({ ...env, databaseUrl: 'postgres://wagering:wagering@localhost:1/wagering', transientRetryTtlSeconds: TTL_SECONDS });
     down.useLogger(false);
     await down.init();
     try {
@@ -160,13 +162,12 @@ describe('consumer', () => {
       await queues.sendWager(wagerData(wallet, 'BET', '10.00'));
 
       expect(await down.get(WagerConsumer).pollOnce(1)).toBe(1); // falha transitória → volta em 1s
+      const firstReceive = Date.now();
       const hidden = await queues.sqs.send(new ReceiveMessageCommand({ QueueUrl: queues.urls.wager, WaitTimeSeconds: 0 }));
       expect(hidden.Messages ?? []).toEqual([]); // backoff: invisível, não foi deletada
 
-      // banco fora não esgota o orçamento de bug (MAX_RECEIVES): a mensagem válida continua em retry
-      expect(MAX_TRANSIENT_RECEIVES).toBeGreaterThan(MAX_RECEIVES);
-      // gasta os recebimentos 2..8 sem esperar o backoff real (2s, 4s, 8s…)
-      for (let receive = 2; receive < MAX_TRANSIENT_RECEIVES; receive++) {
+      // recebimentos 2..11 sem esperar o backoff real: passa do antigo limite por contagem (9) e da redrive antiga (10)
+      for (let receive = 2; receive <= 11; receive++) {
         let Messages: Message[] = [];
         for (const deadline = Date.now() + 6_000; Messages.length === 0 && Date.now() < deadline;) {
           ({ Messages = [] } = await queues.sqs.send(new ReceiveMessageCommand({
@@ -179,7 +180,14 @@ describe('consumer', () => {
         }));
       }
 
+      // 12º recebimento, ainda dentro do TTL: banco fora não esgota nada, a mensagem válida continua em retry
       await pollUntilReceived(down.get(WagerConsumer));
+      expect(Date.now() - firstReceive).toBeLessThan(TTL_SECONDS * 1000);
+      expect(await dlqCodes()).toEqual([]);
+
+      // o backoff é cortado no fim do TTL: a próxima tentativa já é a última, e vai para a DLQ
+      await pollUntilReceived(down.get(WagerConsumer), (TTL_SECONDS + 10) * 1000);
+      expect(Date.now() - firstReceive).toBeGreaterThanOrEqual((TTL_SECONDS - 1) * 1000);
       expect(await dlqCodes()).toEqual(['RETRIES_EXHAUSTED']);
       expect(await queues.drain('wager')).toEqual([]);
       expect(await balance(wallet.id)).toBe('100.00');

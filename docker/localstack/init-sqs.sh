@@ -8,12 +8,13 @@ DLQ_URL=$(awslocal sqs create-queue --queue-name wager-transactions-dlq.fifo \
 DLQ_ARN=$(awslocal sqs get-queue-attributes --queue-url "$DLQ_URL" \
   --attribute-names QueueArn --query Attributes.QueueArn --output text)
 
-# O app manda para a DLQ no 5º recebimento com falha. A redrive (10) é rede de segurança:
-# devolver mensagens sem processar (shutdown, wallet bloqueada no lote) também conta recebimento.
+# Quem manda para a DLQ é o app: na 5ª falha de bug, ou depois de 30 min de erro transitório (wager-consumer.ts).
+# A redrive (100) é rede de segurança, acima do que esses limites consomem: devolver mensagens sem processar
+# (shutdown, wallet bloqueada no lote) também conta recebimento.
 awslocal sqs create-queue --queue-name wager-transactions.fifo --attributes "{
   \"FifoQueue\": \"true\",
   \"VisibilityTimeout\": \"30\",
-  \"RedrivePolicy\": \"{\\\"deadLetterTargetArn\\\":\\\"$DLQ_ARN\\\",\\\"maxReceiveCount\\\":\\\"10\\\"}\"
+  \"RedrivePolicy\": \"{\\\"deadLetterTargetArn\\\":\\\"$DLQ_ARN\\\",\\\"maxReceiveCount\\\":\\\"100\\\"}\"
 }"
 
 # Destino dos eventos publicados pela outbox. Criada por último: o healthcheck usa ela.

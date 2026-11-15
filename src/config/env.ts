@@ -20,6 +20,8 @@ export type Env = {
   faultInjection?: 'kill-after-commit';
   /** OTLP/HTTP do coletor de traces (ex.: Jaeger). Ausente: tracing desligado. */
   otelEndpoint?: string;
+  /** Quanto tempo (desde o 1º recebimento) o consumer insiste numa mensagem com erro transitório antes da DLQ. */
+  transientRetryTtlSeconds: number;
 };
 
 /** Token de injeção do Nest para o objeto Env. */
@@ -46,6 +48,9 @@ export function loadEnv(source: Record<string, string | undefined>): Env {
   const fault = source.FAULT_INJECTION?.trim() || undefined;
   if (fault !== undefined && fault !== 'kill-after-commit') throw new Error('Variável de ambiente inválida: FAULT_INJECTION (kill-after-commit)');
 
+  const rawTtl = source.SQS_TRANSIENT_RETRY_TTL_SECONDS?.trim() || '1800';
+  if (!/^[1-9]\d*$/.test(rawTtl)) throw new Error('Variável de ambiente inválida: SQS_TRANSIENT_RETRY_TTL_SECONDS');
+
   return {
     port,
     databaseUrl: required('DATABASE_URL'),
@@ -63,5 +68,6 @@ export function loadEnv(source: Record<string, string | undefined>): Env {
     auth: issuer && jwksUrl ? { issuer, jwksUrl } : undefined,
     faultInjection: fault,
     otelEndpoint: source.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() || undefined,
+    transientRetryTtlSeconds: Number(rawTtl),
   };
 }

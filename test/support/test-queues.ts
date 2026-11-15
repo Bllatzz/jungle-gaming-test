@@ -25,7 +25,7 @@ export async function freshTestQueues(env: Env, suite: string, visibilityTimeout
   const urls = {
     wager: await create(names.wager, {
       VisibilityTimeout: String(visibilityTimeout),
-      RedrivePolicy: JSON.stringify({ deadLetterTargetArn: Attributes!.QueueArn, maxReceiveCount: '10' }),
+      RedrivePolicy: JSON.stringify({ deadLetterTargetArn: Attributes!.QueueArn, maxReceiveCount: '100' }),
     }),
     wagerDlq: dlqUrl,
     events: await create(names.events),

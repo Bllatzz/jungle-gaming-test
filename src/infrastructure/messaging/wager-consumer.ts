@@ -18,13 +18,13 @@ export const CONSUMER_NAME = 'wager-transactions-consumer';
  * Falhas de processamento antes da DLQ, contadas pelo app em consumer_message_failures — não pelo
  * ApproximateReceiveCount do SQS, que também sobe quando a mensagem é só devolvida sem processar (shutdown,
  * irmã de grupo bloqueado). Com o banco fora não dá para contar: aí vale o ApproximateReceiveCount.
- * MAX_RECEIVES vale para erro não transitório (bug); erro transitório (banco fora, lock_timeout) tem orçamento
- * próprio, maior: com backoff 1+2+4+8+16+32+60+60 s, a mensagem aguenta ~3 min de queda antes da DLQ — um restart
- * ou failover do Postgres não manda mensagem válida para a DLQ.
- * A redrive policy da fila (maxReceiveCount 10) é só rede de segurança, acima dos dois limites.
+ * MAX_RECEIVES vale para erro não transitório (bug). Erro transitório (banco fora, lock_timeout) tem limite de
+ * tempo, não de contagem: a mensagem só vai para a DLQ depois de `transientRetryTtlSeconds` (padrão 30 min)
+ * desde o 1º recebimento, com backoff até 60 s entre tentativas. Por tempo porque, com o banco fora, as irmãs do
+ * grupo também acumulam recebimentos: um limite de contagem as mandaria para a DLQ em cascata.
+ * A redrive policy da fila (maxReceiveCount 100) é só rede de segurança, acima do que 30 min de retry consomem.
  */
 export const MAX_RECEIVES = 5;
-export const MAX_TRANSIENT_RECEIVES = 9;
 const MAX_BACKOFF_SECONDS = 60;
 const WAIT_TIME_SECONDS = 10;
 /** Visibilidade pedida no receive; o lote para de ser processado antes dela vencer (o resto volta para a fila). */
@@ -61,7 +61,7 @@ export class WagerConsumer {
         MaxNumberOfMessages: 10,
         WaitTimeSeconds: waitTimeSeconds,
         VisibilityTimeout: VISIBILITY_SECONDS,
-        MessageSystemAttributeNames: ['ApproximateReceiveCount', 'MessageGroupId'],
+        MessageSystemAttributeNames: ['ApproximateReceiveCount', 'ApproximateFirstReceiveTimestamp', 'MessageGroupId'],
         MessageAttributeNames: ['traceparent'],
       }),
       { abortSignal: signal },
@@ -116,7 +116,10 @@ export class WagerConsumer {
       // permanente não precisa contar; o resto conta a falha desta mensagem (banco fora: vale o receiveCount)
       const failures = permanent || !messageId ? receiveCount : await this.countFailure(messageId).catch(() => receiveCount);
       log.failures = failures;
-      if (permanent || failures >= (isTransient(error) ? MAX_TRANSIENT_RECEIVES : MAX_RECEIVES)) {
+      const firstReceivedAt = Number(message.Attributes?.ApproximateFirstReceiveTimestamp ?? Date.now());
+      const ttlLeftMs = firstReceivedAt + this.env.transientRetryTtlSeconds * 1000 - Date.now();
+      const exhausted = isTransient(error) ? ttlLeftMs <= 0 : failures >= MAX_RECEIVES;
+      if (permanent || exhausted) {
         const code = permanent ?? (isTransient(error) ? 'RETRIES_EXHAUSTED' : 'PROCESSING_FAILED');
         await this.deadLetter(QueueUrl, message, code);
         if (messageId && !permanent) await this.clearFailures(messageId);
@@ -124,8 +127,9 @@ export class WagerConsumer {
         this.logger.warn({ msg: 'message dead-lettered', ...log, errorCode: code, error: (error as Error).message });
         return 'dead-lettered';
       }
-      // transitório (ou bug): volta depois de 1s, 2s, 4s…
-      const delay = Math.min(2 ** (failures - 1), MAX_BACKOFF_SECONDS);
+      // transitório (ou bug): volta depois de 1s, 2s, 4s… e, se transitório, a última tentativa cai no fim do TTL
+      const backoff = Math.min(2 ** (failures - 1), MAX_BACKOFF_SECONDS);
+      const delay = isTransient(error) ? Math.max(1, Math.min(backoff, Math.ceil(ttlLeftMs / 1000))) : backoff;
       await this.setVisibility(QueueUrl, message, delay);
       this.metrics.inc('wager_retries_total', { component: 'sqs_consumer' });
       this.logger.warn({ msg: 'message retry scheduled', ...log, delaySeconds: delay, transient: isTransient(error), error: (error as Error).message });

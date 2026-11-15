@@ -59,3 +59,11 @@ test('FAULT_INJECTION só aceita kill-after-commit (ponto de falha dos testes de
   expect(loadEnv({ ...valid, FAULT_INJECTION: 'kill-after-commit' }).faultInjection).toBe('kill-after-commit');
   expect(() => loadEnv({ ...valid, FAULT_INJECTION: 'outra' })).toThrow('FAULT_INJECTION');
 });
+
+test('TTL do retry transitório do consumer: padrão 30 min, inteiro positivo', () => {
+  expect(loadEnv(valid).transientRetryTtlSeconds).toBe(1800);
+  expect(loadEnv({ ...valid, SQS_TRANSIENT_RETRY_TTL_SECONDS: '60' }).transientRetryTtlSeconds).toBe(60);
+  for (const SQS_TRANSIENT_RETRY_TTL_SECONDS of ['0', '-1', '1.5', 'abc']) {
+    expect(() => loadEnv({ ...valid, SQS_TRANSIENT_RETRY_TTL_SECONDS })).toThrow('SQS_TRANSIENT_RETRY_TTL_SECONDS');
+  }
+});
