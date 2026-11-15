@@ -106,7 +106,8 @@ export class WagerRepository implements WagerStore {
    * Ordem estrita por wallet: só entra uma wallet cujo evento mais antigo ainda não publicado (a "cabeça") está
    * vencido, e essa cabeça é travada com SKIP LOCKED. Enquanto um publisher tem a cabeça (reservada ou em
    * backoff), nenhum outro pega eventos posteriores da mesma wallet; publishers concorrentes ficam com wallets
-   * disjuntas.
+   * disjuntas. A ordem é a de `seq` (sequência do banco sorteada com a wallet travada), não a de occurred_at,
+   * que vem do relógio de cada instância (migration 20261115150000).
    */
   async claimDueOutbox(now: Date, until: Date, limit: number): Promise<{ message: OutboxMessage; traceparent: string | null }[]> {
     const run = <T>(sql: string, params: unknown[]) => this.em.getConnection().execute<T>(sql, params, 'all', this.em.getTransactionContext());
@@ -115,26 +116,26 @@ export class WagerRepository implements WagerStore {
         where o.published_at is null and (o.next_attempt_at is null or o.next_attempt_at <= ?)
           and not exists (select 1 from outbox_messages p
                            where p.aggregate_id = o.aggregate_id and p.published_at is null
-                             and (p.occurred_at, p.id) < (o.occurred_at, o.id))
-        order by o.occurred_at, o.id
+                             and p.seq < o.seq)
+        order by o.seq
         limit ? for update skip locked`,
       [now, limit],
     );
     if (heads.length === 0) return [];
-    const ids = await run<{ id: string }[]>(
+    const ids = await run<{ id: string; seq: string }[]>(
       `update outbox_messages set next_attempt_at = ?
         where id in (select id from outbox_messages
                       where aggregate_id in (${heads.map(() => '?').join(', ')}) and published_at is null
                         and (next_attempt_at is null or next_attempt_at <= ?)
-                      order by occurred_at, id
+                      order by seq
                       limit ? for update)
-        returning id`,
+        returning id, seq`,
       [until, ...heads.map((h: { aggregate_id: string }) => h.aggregate_id), now, limit],
     );
     if (ids.length === 0) return [];
-    const rows = await this.em.find(
-      OutboxMessageEntity, { id: { $in: ids.map((r: { id: string }) => r.id) } }, { orderBy: { occurredAt: 'asc', id: 'asc' } },
-    );
+    const seqOf = new Map<string, bigint>(ids.map((r: { id: string; seq: string }) => [r.id, BigInt(r.seq)]));
+    const rows = await this.em.find(OutboxMessageEntity, { id: { $in: [...seqOf.keys()] } });
+    rows.sort((x, y) => (seqOf.get(x.id)! < seqOf.get(y.id)! ? -1 : 1));
     return rows.map((row) => ({ message: map.toOutboxMessage(row), traceparent: row.traceparent ?? null }));
   }
 

@@ -288,7 +288,9 @@ describe('outbox', () => {
       // ordem estrita por wallet: cada wallet tem mais de um lote de 10 e dois publishers disputando, e mesmo
       // assim a FIFO entrega os eventos dela na ordem em que foram gravados na outbox
       for (const w of wallets) {
-        const written = await db().find(OutboxMessageEntity, { aggregateId: w.id }, { orderBy: { occurredAt: 'asc', id: 'asc' } });
+        // seq: a ordem em que a outbox gravou (sequência do banco), independente do relógio do app
+        const written = await db().getConnection().execute<{ id: string }[]>(
+          'select id from outbox_messages where aggregate_id = ? order by seq', [w.id]);
         expect(written.length).toBeGreaterThan(10);
         expect(events.filter((e) => e.aggregateId === w.id).map((e) => e.eventId)).toEqual(written.map((m) => m.id));
       }
