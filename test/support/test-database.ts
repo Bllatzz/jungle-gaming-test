@@ -1,3 +1,4 @@
+import { afterAll, afterEach, expect } from 'bun:test';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { type Env, loadEnv } from '../../src/config/env';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
@@ -48,6 +49,21 @@ export async function walletsDivergingFromLedger(orm: MikroORM): Promise<{ id: s
     left join (select account, sum(case direction when 'CREDIT' then amount else -amount end) as net
                  from ledger_postings group by account) p on p.account = 'wallet:' || w.id
     where w.balance <> coalesce(l.net, 0) or w.balance <> coalesce(p.net, 0)`);
+}
+
+/**
+ * Invariante final depois de **cada** teste da suíte, não só no fim: nenhum teste deixa uma wallet com saldo ≠
+ * ledger. `ignore`: wallets corrompidas de propósito (reconciliação).
+ */
+export function checkLedgerInvariantAfterEach(env: () => Env, ignore: () => string[] = () => []): void {
+  let orm: MikroORM | undefined;
+  afterEach(async () => {
+    orm ??= await MikroORM.init(createOrmConfig(asOwner(env())));
+    expect((await walletsDivergingFromLedger(orm)).filter((w) => !ignore().includes(w.id))).toEqual([]);
+  });
+  afterAll(async () => {
+    await orm?.close();
+  });
 }
 
 /**

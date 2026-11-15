@@ -9,15 +9,17 @@ import { WagerTransactionStatus } from '../../src/domain/wager-transaction';
 import { InboxMessageEntity, LedgerEntryEntity, WagerTransactionEntity } from '../../src/infrastructure/persistence/entities';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { openWallet, reconcile, wagerPayload } from '../support/api-client';
-import { freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
+import { checkLedgerInvariantAfterEach, freshTestDatabase, walletsDivergingFromLedger } from '../support/test-database';
 import { freshTestQueues } from '../support/test-queues';
 
 // kill -9 garantidamente ENTRE o commit e o ack (§13, cenário 5): o processo roda com
 // FAULT_INJECTION=kill-after-commit e se mata com SIGKILL logo depois do commit. Outro processo, normal,
 // recebe a redelivery. No teste de carga (messaging.test.ts) o kill cai em ponto aleatório; aqui é o ponto exato.
 
-const PORTS = { faulty: 39121, healthy: 39122 };
+// abaixo de 32768: fora da faixa efêmera do Linux, que o kernel usa nas conexões de saída (pool, SQS) e dava EADDRINUSE
+const PORTS = { faulty: 29121, healthy: 29122 };
 let env: Env;
+checkLedgerInvariantAfterEach(() => env);
 let queues: Awaited<ReturnType<typeof freshTestQueues>>;
 let orm: MikroORM;
 const procs: Subprocess[] = [];

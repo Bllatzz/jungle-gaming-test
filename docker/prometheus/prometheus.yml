@@ -12,4 +12,4 @@ scrape_configs:
   # Alvos parados aparecem com up=0, sem efeito nos painéis.
   - job_name: wagering-host
     static_configs:
-      - targets: ['host.docker.internal:3000', 'host.docker.internal:39201', 'host.docker.internal:39202', 'host.docker.internal:39203']
+      - targets: ['host.docker.internal:3000', 'host.docker.internal:29201', 'host.docker.internal:29202', 'host.docker.internal:29203']

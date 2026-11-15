@@ -7,15 +7,17 @@ import type { Env } from '../../src/config/env';
 import { InboxMessageEntity, OutboxMessageEntity, WagerTransactionEntity } from '../../src/infrastructure/persistence/entities';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { call, openWallet, reconcile, send, wagerPayload } from '../support/api-client';
-import { freshTestDatabase } from '../support/test-database';
+import { checkLedgerInvariantAfterEach, freshTestDatabase } from '../support/test-database';
 import { freshTestQueues } from '../support/test-queues';
 
 // 3 processos reais com consumer, publisher e worker de referências ligados, nas mesmas filas e banco.
 // No meio da carga: um morre com kill -9 (depois de commits sem ack), outro recebe SIGTERM. Os dois voltam.
 
-const ports = [39111, 39112, 39113];
+// abaixo de 32768: fora da faixa efêmera do Linux, que o kernel usa nas conexões de saída (pool, SQS) e dava EADDRINUSE
+const ports = [29111, 29112, 29113];
 const urls = ports.map((p) => `http://localhost:${p}`);
 let env: Env;
+checkLedgerInvariantAfterEach(() => env);
 let queues: Awaited<ReturnType<typeof freshTestQueues>>;
 let orm: MikroORM;
 const instances = new Map<number, Subprocess>();

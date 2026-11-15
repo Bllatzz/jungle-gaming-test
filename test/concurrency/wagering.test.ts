@@ -5,11 +5,12 @@ import type { INestApplication } from '@nestjs/common';
 import { createApp } from '../../src/bootstrap';
 import type { Env } from '../../src/config/env';
 import { call, openWallet, reconcile, send, wagerPayload, type TestWallet } from '../support/api-client';
-import { freshTestDatabase } from '../support/test-database';
+import { checkLedgerInvariantAfterEach, freshTestDatabase } from '../support/test-database';
 
 // Paralelismo real: requisições HTTP simultâneas, cada uma na sua conexão do pool, contra Postgres real.
 
 let env: Env;
+checkLedgerInvariantAfterEach(() => env);
 let app: INestApplication;
 let url: string;
 const bet = (wallet: TestWallet, amount: string) => wagerPayload(wallet, 'BET', amount);
@@ -78,7 +79,8 @@ test('wallets diferentes em paralelo terminam consistentes', async () => {
 });
 
 describe('3 instâncias do app ao mesmo tempo', () => {
-  const ports = [39101, 39102, 39103];
+  // abaixo de 32768: fora da faixa efêmera do Linux, que o kernel usa nas conexões de saída (pool, SQS) e dava EADDRINUSE
+  const ports = [29101, 29102, 29103];
   let instances: Subprocess[] = [];
 
   beforeAll(async () => {

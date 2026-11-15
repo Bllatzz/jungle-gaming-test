@@ -17,7 +17,8 @@ const positiveInt = (name: string, fallback: number): number => {
 const CONCURRENCY = positiveInt('LOAD_CONCURRENCY', 64);
 const DURATION_MS = positiveInt('LOAD_DURATION_S', 30) * 1_000;
 const WALLETS = positiveInt('LOAD_WALLETS', 200);
-const PORTS = [39201, 39202, 39203];
+// abaixo de 32768: fora da faixa efêmera do Linux, que o kernel usa nas conexões de saída (pool, SQS) e dava EADDRINUSE
+const PORTS = [29201, 29202, 29203];
 const urls = PORTS.map((p) => `http://localhost:${p}`);
 
 /** Maior que o saldo de qualquer wallet da carga (100000.00 + WINs): sempre rejeitada. */
