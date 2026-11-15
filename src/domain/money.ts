@@ -5,8 +5,8 @@ import { CurrencyMismatchError, InvalidMoneyError } from './errors';
 const Decimal = DecimalBase.clone({ precision: 40 });
 type Decimal = InstanceType<typeof Decimal>;
 
-// Até 18 dígitos inteiros e 2 decimais: cabe em NUMERIC(20,2). Sem sinal, espaço, expoente ou zero à esquerda.
-const AMOUNT_PATTERN = /^(0|[1-9]\d{0,17})(\.\d{1,2})?$/;
+// Escala fixa: até 18 dígitos inteiros e exatamente 2 decimais (cabe em NUMERIC(20,2)). Sem sinal, espaço, expoente ou zero à esquerda.
+const AMOUNT_PATTERN = /^(0|[1-9]\d{0,17})\.\d{2}$/;
 const CURRENCY_PATTERN = /^[A-Z]{3}$/;
 const STORAGE_LIMIT = new Decimal('1e18');
 
@@ -23,7 +23,7 @@ export class Money {
     public readonly currency: string,
   ) {}
 
-  /** Contrato de entrada: rejeita negativos e qualquer formato ambíguo. */
+  /** Contrato de entrada: exige "0.00" (escala fixa de 2 casas); rejeita negativos e qualquer formato ambíguo. */
   static from(props: MoneyProps): Money {
     if (typeof props?.amount !== 'string' || !AMOUNT_PATTERN.test(props.amount)) {
       throw new InvalidMoneyError(`Valor monetário inválido: ${JSON.stringify(props?.amount)}`);

@@ -13,8 +13,9 @@ test('mesmo payload em outra ordem de chaves → mesmo hash', () => {
   expect(wagerPayloadHash(reordered)).toBe(wagerPayloadHash(base));
 });
 
-test('"25.0" e "25.00" são o mesmo valor → mesmo hash', () => {
-  expect(wagerPayloadHash({ ...base, money: Money.from({ amount: '25.0', currency: 'BRL' }) })).toBe(wagerPayloadHash(base));
+test('mesmo valor montado de outro jeito → mesmo hash (depende do valor, não da instância)', () => {
+  const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
+  expect(wagerPayloadHash({ ...base, money: brl('20.00').add(brl('5.00')) })).toBe(wagerPayloadHash(base));
 });
 
 test('referência ausente e undefined são a mesma coisa', () => {

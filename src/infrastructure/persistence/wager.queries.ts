@@ -74,8 +74,8 @@ export class WagerQueries implements ReconciliationSource {
         const row = await em.findOne(WalletEntity, { id: walletId });
         if (!row) return undefined;
         const [sums] = await em.getConnection().execute<{ credits: string; debits: string; entries: string }[]>(
-          `select coalesce(sum(amount) filter (where direction = 'CREDIT'), 0)::text as credits,
-                  coalesce(sum(amount) filter (where direction = 'DEBIT'), 0)::text as debits,
+          `select coalesce(sum(amount) filter (where direction = 'CREDIT'), 0.00)::text as credits,
+                  coalesce(sum(amount) filter (where direction = 'DEBIT'), 0.00)::text as debits,
                   count(*)::text as entries
              from wallet_ledger_entries where wallet_id = ?`,
           [walletId], 'all', em.getTransactionContext(),

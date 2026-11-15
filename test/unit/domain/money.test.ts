@@ -5,17 +5,17 @@ import { Money } from '../../../src/domain/money';
 const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
 
 describe('Money.from — contrato de entrada', () => {
-  test('aceita até 2 casas e serializa sempre com 2', () => {
-    expect(brl('25').toString()).toBe('25.00');
-    expect(brl('25.5').toJSON()).toEqual({ amount: '25.50', currency: 'BRL' });
+  test('aceita exatamente 2 casas e serializa sempre com 2', () => {
+    expect(brl('25.00').toString()).toBe('25.00');
+    expect(brl('25.50').toJSON()).toEqual({ amount: '25.50', currency: 'BRL' });
     expect(brl('0.01').toString()).toBe('0.01');
-    expect(brl('0').toString()).toBe('0.00');
+    expect(brl('0.00').toString()).toBe('0.00');
   });
 
   test.each([
     ['', 'vazio'], [' 10.00', 'espaço'], ['10.001', '3 casas'], ['-10.00', 'negativo'], ['+10', 'sinal'],
     ['NaN', 'NaN'], ['Infinity', 'Infinity'], ['1e3', 'notação científica'], ['010.00', 'zero à esquerda'],
-    ['10.', 'ponto sem casas'], ['.50', 'sem parte inteira'], ['1,00', 'vírgula'], ['1234567890123456789', '19 dígitos'],
+    ['10.', 'ponto sem casas'], ['25', 'sem casas'], ['25.5', '1 casa'], ['0', 'zero sem casas'], ['.50', 'sem parte inteira'], ['1,00', 'vírgula'], ['1234567890123456789', '19 dígitos'],
   ])('rejeita %p (%s)', (amount) => {
     expect(() => brl(amount)).toThrow(InvalidMoneyError);
   });
@@ -57,8 +57,8 @@ describe('Money — aritmética exata e imutável', () => {
     expect(brl('0.01').isPositive()).toBe(true);
     expect(brl('1.00').isLessThan(brl('1.01'))).toBe(true);
     expect(brl('1.00').isLessThan(brl('1.00'))).toBe(false);
-    expect(brl('1.0').equals(brl('1.00'))).toBe(true);
-    expect(Money.zero('BRL').equals(brl('0'))).toBe(true);
+    expect(brl('0.50').add(brl('0.50')).equals(brl('1.00'))).toBe(true);
+    expect(Money.zero('BRL').equals(brl('0.00'))).toBe(true);
   });
 
   test('moedas diferentes lançam CurrencyMismatchError', () => {

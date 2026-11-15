@@ -80,8 +80,8 @@ describe('POST /wagering/transactions', () => {
   test('replay idêntico → mesma resposta com idempotentReplay: true, sem novo débito', async () => {
     const wallet = await openWallet();
     const first = await submit(wallet, 'BET', '25.00');
-    // "25.0" e "25.00" são o mesmo payload (hash canônico normaliza o dinheiro)
-    const again = await send({ ...first.payload, money: { amount: '25.0', currency: 'BRL' } });
+    // chaves em outra ordem são o mesmo payload (hash de JSON canônico)
+    const again = await send(Object.fromEntries(Object.entries(first.payload).reverse()));
     expect(again.status).toBe(200);
     expect(again.body).toEqual({ ...first.body, idempotentReplay: true });
     expect((await call('GET', `/wallets/${wallet.id}`)).body.balance.amount).toBe('75.00');
@@ -226,6 +226,8 @@ describe('POST /wagering/transactions', () => {
       { ...base, providerId: 'Internal' },
       { ...base, externalTransactionId: ' x' }, // espaço na ponta furaria a deduplicação
       { ...base, money: { amount: '-1.00', currency: 'BRL' } },
+      { ...base, money: { amount: '1.5', currency: 'BRL' } }, // escala fixa de 2 casas
+      { ...base, money: { amount: '1', currency: 'BRL' } },
       { ...base, walletId: 'nao-e-uuid' },
       { ...base, kind: 'REFUND' }, // REFUND sem referência
       { ...base, externalTransactionId: 'tx\u0000' }, // o Postgres recusaria: seria 500

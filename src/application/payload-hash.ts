@@ -17,7 +17,7 @@ export interface WagerPayload {
 
 /**
  * SHA-256 (hex) do JSON canônico: chaves em ordem alfabética, sem espaços, campos ausentes omitidos.
- * money passa pelo Money, então "25.0" e "25.00" geram o mesmo hash.
+ * money entra como Money.toString(): o hash depende do valor, não de como o objeto foi montado.
  */
 export function wagerPayloadHash(payload: WagerPayload): string {
   // campos escolhidos um a um: quem chama pode passar um objeto maior (ex.: com idempotencyKey)
