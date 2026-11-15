@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # Réplicas do compose (`--scale app=N`): o DNS do Docker devolve um IP por réplica.
+  - job_name: wagering
+    dns_sd_configs:
+      - names: [app]
+        type: A
+        port: 3000
+  # App rodando no host: `bun run start:dev` (3000) e os 3 processos do `bun run test:load`.
+  # Alvos parados aparecem com up=0, sem efeito nos painéis.
+  - job_name: wagering-host
+    static_configs:
+      - targets: ['host.docker.internal:3000', 'host.docker.internal:39201', 'host.docker.internal:39202', 'host.docker.internal:39203']
