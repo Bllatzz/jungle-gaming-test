@@ -3,11 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { ChangeMessageVisibilityCommand, type Message, ReceiveMessageCommand } from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
+import { ProcessWagerTransaction } from '../../src/application/process-wager-transaction';
 import { MAX_REFERENCE_ATTEMPTS, ResolvePendingReferences } from '../../src/application/resolve-pending-references';
 import { createApp } from '../../src/bootstrap';
 import type { Env } from '../../src/config/env';
 import { OutboxPublisher, SQS_TIMEOUT_MS } from '../../src/infrastructure/messaging/outbox-publisher';
-import { CONSUMER_NAME, MAX_RECEIVES, WagerConsumer } from '../../src/infrastructure/messaging/wager-consumer';
+import { CONSUMER_NAME, MAX_RECEIVES, MAX_TRANSIENT_RECEIVES, WagerConsumer } from '../../src/infrastructure/messaging/wager-consumer';
 import {
   InboxMessageEntity, LedgerEntryEntity, OutboxMessageEntity, WagerTransactionEntity,
 } from '../../src/infrastructure/persistence/entities';
@@ -147,9 +148,9 @@ describe('consumer', () => {
     expect((await dlqCodes()).sort()).toEqual(['INVALID_MESSAGE', 'INVALID_MONEY', 'MESSAGE_ID_CONFLICT', 'WALLET_NOT_FOUND']);
     expect(await balance(wallet.id)).toBe('99.00'); // só a primeira com o messageId reutilizado
     expect(await queues.drain('wager')).toEqual([]);
-  });
+  }, 15_000); // até 5 voltas de long polling: os 5 s padrão estouraram com o LocalStack recém-subido
 
-  test(`transitório: retry com backoff e, no ${MAX_RECEIVES}º recebimento, DLQ`, async () => {
+  test(`transitório: retry com backoff e, só no ${MAX_TRANSIENT_RECEIVES}º recebimento, DLQ`, async () => {
     // segunda instância com o banco fora do ar, nas mesmas filas
     const down = await createApp({ ...env, databaseUrl: 'postgres://wagering:wagering@localhost:1/wagering' });
     down.useLogger(false);
@@ -162,8 +163,10 @@ describe('consumer', () => {
       const hidden = await queues.sqs.send(new ReceiveMessageCommand({ QueueUrl: queues.urls.wager, WaitTimeSeconds: 0 }));
       expect(hidden.Messages ?? []).toEqual([]); // backoff: invisível, não foi deletada
 
-      // gasta os recebimentos 2..4 sem esperar o backoff real (2s, 4s, 8s)
-      for (let receive = 2; receive < MAX_RECEIVES; receive++) {
+      // banco fora não esgota o orçamento de bug (MAX_RECEIVES): a mensagem válida continua em retry
+      expect(MAX_TRANSIENT_RECEIVES).toBeGreaterThan(MAX_RECEIVES);
+      // gasta os recebimentos 2..8 sem esperar o backoff real (2s, 4s, 8s…)
+      for (let receive = 2; receive < MAX_TRANSIENT_RECEIVES; receive++) {
         let Messages: Message[] = [];
         for (const deadline = Date.now() + 6_000; Messages.length === 0 && Date.now() < deadline;) {
           ({ Messages = [] } = await queues.sqs.send(new ReceiveMessageCommand({
@@ -183,6 +186,68 @@ describe('consumer', () => {
     } finally {
       await down.close();
     }
+  }, 90_000);
+
+  test(`banco fora no ${MAX_RECEIVES}º recebimento e de volta: a mensagem é aplicada, não vai para a DLQ`, async () => {
+    const down = await createApp({ ...env, databaseUrl: 'postgres://wagering:wagering@localhost:1/wagering' });
+    down.useLogger(false);
+    await down.init();
+    try {
+      const wallet = await api.openWallet(url, '100.00');
+      await queues.sendWager(wagerData(wallet, 'BET', '10.00'));
+      // recebimentos 1..MAX_RECEIVES-1 sem processar; o MAX_RECEIVES-ésimo falha com o banco fora
+      for (let receive = 1; receive < MAX_RECEIVES; receive++) {
+        let Messages: Message[] = [];
+        for (const deadline = Date.now() + 6_000; Messages.length === 0 && Date.now() < deadline;) {
+          ({ Messages = [] } = await queues.sqs.send(new ReceiveMessageCommand({ QueueUrl: queues.urls.wager, WaitTimeSeconds: 1 })));
+        }
+        await queues.sqs.send(new ChangeMessageVisibilityCommand({
+          QueueUrl: queues.urls.wager, ReceiptHandle: Messages[0]!.ReceiptHandle, VisibilityTimeout: 0,
+        }));
+      }
+      await pollUntilReceived(down.get(WagerConsumer));
+      expect(await dlqCodes()).toEqual([]); // transitório: retry, não DLQ
+
+      await pollUntilReceived(consumer, 30_000); // banco de volta: aplicada depois do backoff
+      expect(await balance(wallet.id)).toBe('90.00');
+      expect(await dlqCodes()).toEqual([]);
+      expect(await queues.drain('wager')).toEqual([]);
+    } finally {
+      await down.close();
+    }
+  }, 60_000);
+});
+
+describe('consumer conta as próprias falhas', () => {
+  test('mensagem só devolvida várias vezes (receive count alto) que falha uma vez não vai para a DLQ', async () => {
+    const wallet = await api.openWallet(url, '100.00');
+    const data = wagerData(wallet, 'BET', '10.00');
+    const messageId = randomUUID();
+    await queues.sendWager(data, messageId);
+    // recebida e devolvida sem processar MAX_RECEIVES vezes (como irmã de um grupo bloqueado, ou shutdown)
+    for (let i = 0; i < MAX_RECEIVES; i++) {
+      let Messages: Message[] = [];
+      for (const deadline = Date.now() + 6_000; Messages.length === 0 && Date.now() < deadline;) {
+        ({ Messages = [] } = await queues.sqs.send(new ReceiveMessageCommand({ QueueUrl: queues.urls.wager, WaitTimeSeconds: 1 })));
+      }
+      await queues.sqs.send(new ChangeMessageVisibilityCommand({
+        QueueUrl: queues.urls.wager, ReceiptHandle: Messages[0]!.ReceiptHandle, VisibilityTimeout: 0,
+      }));
+    }
+    const transient = Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' });
+    const fail = spyOn(ProcessWagerTransaction.prototype, 'execute').mockRejectedValueOnce(transient);
+    try {
+      await pollUntilReceived(); // 1ª falha de processamento desta mensagem: retry, não DLQ
+    } finally {
+      fail.mockRestore();
+    }
+    const [row] = await db().getConnection().execute(
+      `select failures from consumer_message_failures where consumer_name = ? and message_id = ?`, [CONSUMER_NAME, messageId],
+    );
+    expect(row).toEqual({ failures: 1 });
+    await pollUntilReceived(); // volta depois do backoff de 1 s e processa
+    expect(await dlqCodes()).toEqual([]);
+    expect(await balance(wallet.id)).toBe('90.00');
   }, 30_000);
 });
 
@@ -195,10 +260,11 @@ describe('outbox', () => {
     await queues.drain('events');
 
     // eventos commitados por esta instância, que "morre" sem publicar: outra instância assume
-    const wallets = await Promise.all(Array.from({ length: 3 }, () => api.openWallet(url, '100.00')));
-    await Promise.all(wallets.flatMap((w) => Array.from({ length: 4 }, () => api.send(url, api.wagerPayload(w, 'BET', '1.00')))));
+    // mais de duas reservas (50 por volta, publicadas em lotes paralelos de 10): os dois publishers disputam
+    const wallets = await Promise.all(Array.from({ length: 6 }, () => api.openWallet(url, '100.00')));
+    await Promise.all(wallets.flatMap((w) => Array.from({ length: 8 }, () => api.send(url, api.wagerPayload(w, 'BET', '1.00')))));
     const pending = await pendingOutbox();
-    expect(pending).toBeGreaterThan(20);
+    expect(pending).toBeGreaterThan(100);
 
     const other = await createApp(env);
     other.useLogger(false);
@@ -235,7 +301,11 @@ describe('outbox', () => {
     await expect(publisher.publishPending()).rejects.toThrow('morreu antes do commit');
     save.mockRestore();
     expect(await pendingOutbox()).toBe(pending); // nada marcado como publicado
+    // o lote continua reservado (lease) e ninguém o pega antes de vencer — nem este publisher
+    expect(await publisher.publishPending()).toBe(0);
 
+    // a reserva vence (o publisher "morto" não volta): o lote sai de novo
+    await db().nativeUpdate(OutboxMessageEntity, { publishedAt: null }, { nextAttemptAt: new Date(Date.now() - 1) });
     expect(await publisher.publishPending()).toBe(pending);
     expect(await pendingOutbox()).toBe(0);
     // mesmo MessageDeduplicationId: a FIFO entrega uma vez; fora da janela de 5 min, o consumidor deduplica por eventId
@@ -307,11 +377,12 @@ describe('referência fora de ordem (§7.1)', () => {
     expect(await api.reconcile(url, wallet.id)).toMatchObject({ consistent: true });
   });
 
-  test('erro que não é regra de negócio adia a linha sem gastar tentativa e não trava as outras', async () => {
+  test('erro transitório (lock timeout) adia a linha sem gastar tentativa e não trava as outras', async () => {
     const wallet = await api.openWallet(url, '100.00');
     const refund = api.wagerPayload(wallet, 'REFUND', '5.00', { referenceExternalTransactionId: 'ainda-nao' });
     expect((await api.send(url, refund)).status).toBe(202);
-    const lock = spyOn(WagerRepository.prototype, 'lockWallet').mockRejectedValueOnce(new Error('lock timeout'));
+    const lockTimeout = Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' });
+    const lock = spyOn(WagerRepository.prototype, 'lockWallet').mockRejectedValueOnce(lockTimeout);
     try {
       await resolver().runOnce();
     } finally {
@@ -320,6 +391,39 @@ describe('referência fora de ordem (§7.1)', () => {
     const row = await transactionOf(refund);
     expect(row).toMatchObject({ status: 'PENDING_REFERENCE', referenceAttempts: 0 });
     expect(row.nextReferenceAttemptAt.getTime()).toBeGreaterThan(Date.now() + 30_000);
+  });
+
+  test('erro que não é transitório (bug) gasta tentativa; esgotadas, FAILED INTERNAL_ERROR + evento, sem mexer no saldo', async () => {
+    const wallet = await api.openWallet(url, '100.00');
+    const refund = api.wagerPayload(wallet, 'REFUND', '5.00', { referenceExternalTransactionId: 'bug-no-caminho' });
+    const sent = await api.send(url, refund);
+    expect(sent.status).toBe(202);
+    const find = spyOn(WagerRepository.prototype, 'findByExternalId').mockRejectedValue(new Error('bug: coluna inesperada'));
+    try {
+      await resolver().runOnce();
+      const retried = await transactionOf(refund);
+      expect(retried).toMatchObject({ status: 'PENDING_REFERENCE', referenceAttempts: 1 });
+      expect(retried.nextReferenceAttemptAt!.getTime()).toBeGreaterThan(Date.now());
+
+      await db().nativeUpdate(WagerTransactionEntity, { id: retried.id }, {
+        referenceAttempts: MAX_REFERENCE_ATTEMPTS - 1, nextReferenceAttemptAt: new Date(Date.now() - 1),
+      });
+      await resolver().runOnce();
+    } finally {
+      find.mockRestore();
+    }
+    const failed = await transactionOf(refund);
+    expect(failed).toMatchObject({ status: 'FAILED', failureCode: 'INTERNAL_ERROR', referenceAttempts: MAX_REFERENCE_ATTEMPTS, nextReferenceAttemptAt: null });
+    const events = await db().find(OutboxMessageEntity, { aggregateId: wallet.id, eventType: 'WagerTransactionFailed' });
+    expect(events).toHaveLength(1);
+    // o evento do worker leva o correlationId de quem enviou a transação, não o id da transação
+    expect(events[0]!.payload).toMatchObject({ correlationId: failed.correlationId, data: { status: 'FAILED', failureCode: 'INTERNAL_ERROR' } });
+    expect(failed.correlationId).not.toBe(failed.id);
+    // terminal: o replay devolve o desfecho (422, não reenvie; 500 fica só para bug) e o worker não pega mais
+    const replayed = await api.send(url, refund);
+    expect(replayed.status).toBe(422);
+    expect(replayed.body).toMatchObject({ status: 'FAILED', failureCode: 'INTERNAL_ERROR', idempotentReplay: true });
+    expect(await balance(wallet.id)).toBe('100.00');
   });
 
   test('sem referência: backoff a cada tentativa e, esgotado o limite, REJECTED REFERENCE_NOT_FOUND + evento', async () => {
