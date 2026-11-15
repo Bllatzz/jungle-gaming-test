@@ -37,3 +37,17 @@ test('PORT precisa ser inteiro entre 1 e 65535', () => {
     expect(() => loadEnv({ ...valid, PORT })).toThrow('PORT');
   }
 });
+
+test('auth: AUTH_ISSUER e AUTH_JWKS_URL juntas ligam, nenhuma desliga, só uma é erro', () => {
+  expect(loadEnv(valid).auth).toBeUndefined();
+  const auth = { AUTH_ISSUER: 'http://localhost:8080/realms/wagering', AUTH_JWKS_URL: 'http://keycloak:8080/certs' };
+  expect(loadEnv({ ...valid, ...auth }).auth).toEqual({ issuer: auth.AUTH_ISSUER, jwksUrl: auth.AUTH_JWKS_URL });
+  expect(() => loadEnv({ ...valid, AUTH_ISSUER: auth.AUTH_ISSUER })).toThrow('AUTH_JWKS_URL');
+  expect(() => loadEnv({ ...valid, AUTH_JWKS_URL: auth.AUTH_JWKS_URL })).toThrow('AUTH_ISSUER');
+});
+
+test('FAULT_INJECTION só aceita kill-after-commit (ponto de falha dos testes de crash)', () => {
+  expect(loadEnv(valid).faultInjection).toBeUndefined();
+  expect(loadEnv({ ...valid, FAULT_INJECTION: 'kill-after-commit' }).faultInjection).toBe('kill-after-commit');
+  expect(() => loadEnv({ ...valid, FAULT_INJECTION: 'outra' })).toThrow('FAULT_INJECTION');
+});
