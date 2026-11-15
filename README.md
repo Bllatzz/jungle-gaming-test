@@ -49,7 +49,7 @@ curl -X POST localhost:3000/wagering/transactions -H 'content-type: application/
 
 | Endpoint | |
 |---|---|
-| `POST /wallets` | Abre wallet (saldo inicial gera transação OPENING + lançamento) |
+| `POST /wallets` | Abre wallet (saldo inicial gera transação OPENING + lançamento; header `Idempotency-Key` opcional torna o reenvio seguro) |
 | `GET /wallets/:walletId` | Saldo e versão |
 | `GET /wallets/:walletId/ledger?cursor=&limit=` | Histórico paginado |
 | `POST /wallets/:walletId/reconciliation` | Saldo gravado × ledger |
@@ -86,6 +86,44 @@ docker compose up -d --build --wait --scale app=3
 O serviço `migrate` roda as migrations uma única vez antes das réplicas subirem.
 A faixa de portas suporta até 3 réplicas; para mais, amplie `ports` do serviço `app`.
 
+## Autenticação (opcional)
+
+Desligada por padrão. Para ligar, suba o Keycloak (realm `wagering` importado, um client OIDC por
+provedor: `provider-a` e `provider-b`, segredo `<client>-secret`) e descomente `AUTH_ISSUER` e
+`AUTH_JWKS_URL` no `.env`:
+
+```bash
+docker compose --profile auth up -d --wait keycloak     # http://localhost:8180 (admin/admin)
+TOKEN=$(curl -s -d grant_type=client_credentials -d client_id=provider-a -d client_secret=provider-a-secret \
+  localhost:8180/realms/wagering/protocol/openid-connect/token | jq -r .access_token)
+curl localhost:3000/wallets/<walletId> -H "authorization: Bearer $TOKEN"
+```
+
+Com auth ligada, rotas de wallets e transações exigem `Authorization: Bearer`; o `providerId` do body ou
+da rota tem que ser o do token (senão 403). Health e `/metrics` ficam abertos. No compose, o app dentro
+do container busca a JWKS pelo nome do serviço:
+
+```bash
+AUTH_ISSUER=http://localhost:8180/realms/wagering \
+AUTH_JWKS_URL=http://keycloak:8080/realms/wagering/protocol/openid-connect/certs \
+docker compose --profile auth up -d --build --wait --scale app=3
+```
+
+## Dashboard (opcional)
+
+```bash
+docker compose --profile observability up -d --wait    # Prometheus :9090, Grafana http://localhost:3003, Jaeger http://localhost:16686
+```
+
+Para os traces, suba o app com `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` (no host) ou
+`http://jaeger:4318` (no compose): span por requisição e por mensagem, com o `traceparent` viajando
+pela outbox e pelo SQS.
+
+O Prometheus raspa as réplicas do compose (DNS do Docker, uma por réplica) e também o app rodando no
+host (`start:dev` na 3000 e os processos do `test:load`). O Grafana abre direto no dashboard
+"Wagering Processor": transações por status, latência p50/p95/p99, outbox lag e pendentes, duplicatas,
+conflitos de lock, retries, DLQ e divergências de reconciliação.
+
 ## Scripts
 
 | Script | Faz |
@@ -94,10 +132,10 @@ A faixa de portas suporta até 3 réplicas; para mais, amplie `ports` do serviç
 | `start` / `start:dev` | Sobe o app / com reload automático |
 | `typecheck` | Checagem de tipos (TypeScript strict) |
 | `lint` | Typecheck com as checagens extras do compilador: import/variável/parâmetro sem uso, `switch` sem `break`, caminho sem `return`, `override` explícito, código inalcançável |
-| `migration:create` / `migration:up` / `migration:down` | Cria / aplica / reverte migrations. Migration nova precisa ser registrada em `src/infrastructure/persistence/migrations/index.ts` |
+| `migration:create` / `migration:up` / `migration:down` | Cria / aplica / reverte migrations (descobertas pelo nome do arquivo; `up`/`down` concorrentes esperam um advisory lock) |
 | `test` | Testes de unidade (sem containers) |
 | `test:integration` | Testes de integração (exige `infra:up`) |
-| `test:concurrency` | Testes de concorrência: 3 processos do app ao mesmo tempo, `kill -9` e SIGTERM no meio da carga (exige `infra:up`) |
+| `test:concurrency` | Testes de concorrência: 3 processos do app ao mesmo tempo, `kill -9` e SIGTERM no meio da carga, e `kill -9` exatamente entre commit e ack (via `FAULT_INJECTION=kill-after-commit`, só para teste) (exige `infra:up`) |
 | `test:load` | Teste de carga: 3 processos com workers, carga mista por 30s, relatório de throughput, p50/p95/p99, erros, conflitos e outbox lag (exige `infra:up`; `LOAD_CONCURRENCY`, `LOAD_DURATION_S`, `LOAD_WALLETS`). Resultado e análise em [ARCHITECTURE.md](ARCHITECTURE.md#teste-de-carga) |
 
 Mapa dos 8 cenários de concorrência do desafio: os itens 1 a 5, 7 e 8 estão em `test/concurrency`; o 6
