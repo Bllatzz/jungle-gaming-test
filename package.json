@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "infra:up": "docker compose up -d --wait postgres localstack",
+    "infra:up": "docker compose up -d --wait postgres localstack && docker compose run --rm roles",
     "infra:down": "docker compose down -v",
     "start": "bun run src/main.ts",
     "start:dev": "bun --watch src/main.ts",
