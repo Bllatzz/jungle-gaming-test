@@ -27,7 +27,7 @@ describe('OutboxMessage', () => {
   const event = () => {
     const w = walletWith('100.00');
     const bet = tx(K.Bet, '10.00');
-    const d = applyWager({ wallet: w, transaction: bet, reference: undefined, referenceAlreadyReversedBySameKind: false, ledgerEntryId: 'entry-x', now: NOW });
+    const d = applyWager({ wallet: w, transaction: bet, reference: undefined, referenceAlreadyReversed: false, ledgerEntryId: 'entry-x', now: NOW });
     if (d.status !== 'PROCESSED' || !d.ledgerEntry) throw new Error('setup');
     return WalletBalanceChanged.from(w, d.ledgerEntry, ctx);
   };
@@ -84,7 +84,7 @@ describe('Eventos de integração', () => {
   test('Processed, Rejected e PendingReference: aggregateId = walletId, eventType/version no tipo', () => {
     const w = walletWith('100.00');
     const loss = tx(K.Loss, '0.00');
-    applyWager({ wallet: w, transaction: loss, reference: undefined, referenceAlreadyReversedBySameKind: false, ledgerEntryId: 'entry-x', now: NOW });
+    applyWager({ wallet: w, transaction: loss, reference: undefined, referenceAlreadyReversed: false, ledgerEntryId: 'entry-x', now: NOW });
     const processed = WagerTransactionProcessed.from(loss, w, ctx).toJSON();
     expect(processed).toMatchObject({ eventType: 'WagerTransactionProcessed', version: 1, aggregateId: 'wallet-1' });
     expect(processed.data).toMatchObject({ transactionId: loss.id, kind: 'LOSS', status: 'PROCESSED', balance: { amount: '100.00', currency: 'BRL' } });

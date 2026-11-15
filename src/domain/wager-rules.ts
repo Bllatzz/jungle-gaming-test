@@ -14,25 +14,18 @@ export interface ApplyWagerInput {
   transaction: WagerTransaction;
   /** Resolvida pelo use case via (providerId, referenceExternalTransactionId). */
   reference: WagerTransaction | undefined;
-  /** Já existe reversão PROCESSED desta referência com o mesmo kind? (regra 4, leitura literal) */
-  referenceAlreadyReversedBySameKind: boolean;
+  /** Já existe REFUND/ROLLBACK PROCESSED desta referência, de qualquer tipo? (regra 4) */
+  referenceAlreadyReversed: boolean;
   /** Id do lançamento, se houver movimento (gerado fora: o domínio é determinístico). */
   ledgerEntryId: string;
   now: Date;
 }
 
-/** Que kinds cada operação pode referenciar (§7, regra 3; WIN e LOSS podem referenciar a BET da rodada). */
-const ALLOWED_REFERENCE_KINDS: Partial<Record<Kind, Kind[]>> = {
-  [Kind.Win]: [Kind.Bet],
-  [Kind.Loss]: [Kind.Bet],
-  [Kind.Refund]: [Kind.Bet],
-  [Kind.Rollback]: [Kind.Bet, Kind.Win, Kind.Refund],
-};
-
 /**
  * Decide e aplica uma transação na wallet (§7). A primeira regra violada decide o resultado.
- * Já executa a transição na transação e o débito/crédito na wallet; o use case só persiste.
- * Uma rejeição nunca altera a wallet.
+ * As regras moram nos agregados (WagerTransaction: referência; Wallet: saldo e moeda); aqui só a ordem
+ * em que são consultadas. Já executa a transição na transação e o débito/crédito na wallet; o use case
+ * só persiste. Uma rejeição nunca altera a wallet.
  */
 export function applyWager(input: ApplyWagerInput): WagerDecision {
   const { wallet, transaction, now } = input;
@@ -57,17 +50,17 @@ export function applyWager(input: ApplyWagerInput): WagerDecision {
   if (transaction.referenceExternalTransactionId) {
     // Erros que nenhuma espera resolve: rejeita já, em vez de deixar em PENDING_REFERENCE até o TTL.
     const selfReference = transaction.referenceExternalTransactionId === transaction.externalTransactionId;
-    if (!ALLOWED_REFERENCE_KINDS[transaction.kind] || selfReference) return reject(FailureCode.ReferenceInvalidKind);
-    if (reference && !sameContext(transaction, reference)) return reject(FailureCode.ReferenceMismatch);
+    if (!transaction.acceptsReference() || selfReference) return reject(FailureCode.ReferenceInvalidKind);
+    if (reference && !transaction.sharesContextWith(reference)) return reject(FailureCode.ReferenceMismatch);
     // o tipo da referência não muda enquanto ela espera: tipo errado rejeita mesmo com ela pendente
-    if (reference && !ALLOWED_REFERENCE_KINDS[transaction.kind]!.includes(reference.kind)) return reject(FailureCode.ReferenceInvalidKind);
+    if (reference && !transaction.canReference(reference.kind)) return reject(FailureCode.ReferenceInvalidKind);
 
     // Regra 8: referência ausente (ou ainda não aplicada) → espera e reprocessa depois.
     if (!reference || reference.status === Status.Pending || reference.status === Status.PendingReference) {
       transaction.markPendingReference();
       return { status: 'PENDING_REFERENCE' };
     }
-    const failure = validateReference(input, reference);
+    const failure = transaction.referenceFailure(reference, input.referenceAlreadyReversed);
     if (failure) return reject(failure);
   }
 
@@ -77,7 +70,7 @@ export function applyWager(input: ApplyWagerInput): WagerDecision {
   }
 
   const direction = transaction.ledgerDirectionFor(reference);
-  if (direction === LedgerDirection.Debit && wallet.balance.isLessThan(transaction.money)) {
+  if (direction === LedgerDirection.Debit && !wallet.canDebit(transaction.money)) {
     // Situações operacionalmente diferentes: aposta sem saldo vs. reversão que negativaria (regra 9).
     return reject(transaction.kind === Kind.Rollback ? FailureCode.ReversalInsufficientFunds : FailureCode.InsufficientFunds);
   }
@@ -88,28 +81,4 @@ export function applyWager(input: ApplyWagerInput): WagerDecision {
       : wallet.credit(transaction.money, transaction.id, input.ledgerEntryId, now);
   transaction.markProcessed(reference?.id, now);
   return { status: 'PROCESSED', ledgerEntry };
-}
-
-/** Regra 2: mesmo provider, player, wallet, moeda e rodada. */
-function sameContext(transaction: WagerTransaction, reference: WagerTransaction): boolean {
-  return (
-    reference.providerId === transaction.providerId &&
-    reference.playerId === transaction.playerId &&
-    reference.walletId === transaction.walletId &&
-    reference.money.currency === transaction.money.currency &&
-    reference.roundId === transaction.roundId
-  );
-}
-
-function validateReference(input: ApplyWagerInput, reference: WagerTransaction): FailureCode | undefined {
-  const { transaction } = input;
-  if (reference.status !== Status.Processed) return FailureCode.ReferenceNotProcessed;
-  if (!ALLOWED_REFERENCE_KINDS[transaction.kind]?.includes(reference.kind)) return FailureCode.ReferenceInvalidKind;
-
-  if (transaction.requiresReference()) {
-    // "Já revertida" antes de "valor errado": diz ao provedor para não reenviar.
-    if (input.referenceAlreadyReversedBySameKind) return FailureCode.ReferenceAlreadyReversed; // regra 4
-    if (!transaction.money.equals(reference.money)) return FailureCode.AmountMismatch; // regra 5
-  }
-  return undefined;
 }

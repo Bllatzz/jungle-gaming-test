@@ -8,7 +8,7 @@ import type { Wallet } from '../../../src/domain/wallet';
 import { NOW, tx, walletWith } from './fixtures';
 
 function apply(wallet: Wallet, transaction: WagerTransaction, reference?: WagerTransaction, alreadyReversed = false) {
-  return applyWager({ wallet, transaction, reference, referenceAlreadyReversedBySameKind: alreadyReversed, ledgerEntryId: `entry-${transaction.id}`, now: NOW });
+  return applyWager({ wallet, transaction, reference, referenceAlreadyReversed: alreadyReversed, ledgerEntryId: `entry-${transaction.id}`, now: NOW });
 }
 /** Referência já aplicada (PROCESSED) na mesma wallet. */
 function processed(wallet: Wallet, transaction: WagerTransaction): WagerTransaction {
@@ -207,14 +207,31 @@ describe('ROLLBACK', () => {
     expect(apply(w, tx(K.Rollback, '10.00', refTo(bet)), bet, true)).toEqual({ status: 'REJECTED', failureCode: F.ReferenceAlreadyReversed });
   });
 
-  test('regra 4 literal: BET já reembolsada ainda aceita ROLLBACK (tipo diferente) — ver ARCHITECTURE.md', () => {
+  test('regra 4: BET já reembolsada não aceita ROLLBACK (uma reversão só, de qualquer tipo) — sem crédito duplo', () => {
     const w = walletWith('100.00');
     const bet = processed(w, tx(K.Bet, '80.00'));
     apply(w, tx(K.Refund, '80.00', refTo(bet)), bet);
+    expect(w.balance.toString()).toBe('100.00');
     const rollback = tx(K.Rollback, '80.00', refTo(bet));
-    apply(w, rollback, bet, false); // não houve ROLLBACK anterior desta BET
-    expect(rollback.status).toBe(S.Processed);
-    expect(w.balance.toString()).toBe('180.00'); // consequência documentada da leitura literal
+    // o use case informa que a BET já tem uma reversão PROCESSED (o REFUND acima)
+    expect(apply(w, rollback, bet, true)).toEqual({ status: 'REJECTED', failureCode: F.ReferenceAlreadyReversed });
+    expect(w.balance.toString()).toBe('100.00');
+  });
+});
+
+describe('WIN/LOSS sobre BET já revertida', () => {
+  test('WIN referenciando BET já reembolsada → REFERENCE_ALREADY_REVERSED, sem pagar o prêmio', () => {
+    const w = walletWith('100.00');
+    const bet = processed(w, tx(K.Bet, '10.00'));
+    const win = tx(K.Win, '50.00', refTo(bet));
+    expect(apply(w, win, bet, true)).toEqual({ status: 'REJECTED', failureCode: F.ReferenceAlreadyReversed });
+    expect(w.balance.toString()).toBe('90.00');
+  });
+
+  test('LOSS referenciando BET já revertida → REFERENCE_ALREADY_REVERSED', () => {
+    const w = walletWith('100.00');
+    const bet = processed(w, tx(K.Bet, '10.00'));
+    expect(apply(w, tx(K.Loss, '0.00', refTo(bet)), bet, true)).toEqual({ status: 'REJECTED', failureCode: F.ReferenceAlreadyReversed });
   });
 });
 

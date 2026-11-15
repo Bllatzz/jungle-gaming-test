@@ -89,6 +89,21 @@ export class WagerTransactionRejected extends IntegrationEvent<WagerTransactionR
   }
 }
 
+/** Erro permanente que não é regra de negócio (ex.: bug recorrente): a transação termina em FAILED, auditável. */
+export class WagerTransactionFailed extends IntegrationEvent<WagerTransactionRejectedData> {
+  readonly eventType = 'WagerTransactionFailed';
+  readonly version = 1;
+
+  static from(transaction: WagerTransaction, ctx: EventContext): WagerTransactionFailed {
+    assertStatus(transaction, WagerTransactionStatus.Failed);
+    return new WagerTransactionFailed({
+      ...ctx,
+      aggregateId: transaction.walletId,
+      data: { ...transactionData(transaction), failureCode: transaction.failureCode as FailureCode },
+    });
+  }
+}
+
 export interface WagerTransactionPendingReferenceData extends TransactionData {
   referenceExternalTransactionId: string;
 }

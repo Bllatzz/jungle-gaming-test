@@ -49,10 +49,15 @@ export class Wallet {
     return this._updatedAt;
   }
 
+  /** O saldo cobre o débito? (Mesma moeda; a de outra moeda é rejeitada antes, por CURRENCY_MISMATCH.) */
+  canDebit(money: Money): boolean {
+    return !this._balance.isLessThan(money);
+  }
+
   /** Lança InsufficientFundsError se o saldo não cobre: quem decide a rejeição de negócio é o applyWager. */
   debit(money: Money, transactionId: string, entryId: string, now: Date): WalletLedgerEntry {
     this.assertMovement(money);
-    if (this._balance.isLessThan(money)) {
+    if (!this.canDebit(money)) {
       throw new InsufficientFundsError(`Saldo ${this._balance} insuficiente para debitar ${money}`);
     }
     return this.apply(LedgerDirection.Debit, money, transactionId, now, entryId);

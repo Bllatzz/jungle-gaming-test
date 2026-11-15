@@ -11,7 +11,7 @@ import { openWallet, type Wallet } from '../../../src/domain/wallet';
 import { brl, NOW, tx, walletWith } from './fixtures';
 
 function apply(wallet: Wallet, transaction: WagerTransaction, reference?: WagerTransaction, alreadyReversed = false) {
-  return applyWager({ wallet, transaction, reference, referenceAlreadyReversedBySameKind: alreadyReversed, ledgerEntryId: `entry-${transaction.id}`, now: NOW });
+  return applyWager({ wallet, transaction, reference, referenceAlreadyReversed: alreadyReversed, ledgerEntryId: `entry-${transaction.id}`, now: NOW });
 }
 const ctx = { eventId: 'e', correlationId: 'c', occurredAt: NOW };
 

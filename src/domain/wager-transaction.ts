@@ -1,5 +1,5 @@
 import { InvalidTransactionError, InvalidTransactionStateError } from './errors';
-import type { FailureCode } from './failure-codes';
+import { FailureCode } from './failure-codes';
 import { LedgerDirection } from './ledger-entry';
 import type { Money } from './money';
 
@@ -43,6 +43,14 @@ export interface WagerTransactionState extends CreateWagerTransactionProps {
   failureCode?: FailureCode;
   processedAt?: Date;
 }
+
+/** Que kinds cada operação pode referenciar (§7, regra 3; WIN e LOSS podem referenciar a BET da rodada). */
+const ALLOWED_REFERENCE_KINDS: Partial<Record<WagerTransactionKind, WagerTransactionKind[]>> = {
+  [WagerTransactionKind.Win]: [WagerTransactionKind.Bet],
+  [WagerTransactionKind.Loss]: [WagerTransactionKind.Bet],
+  [WagerTransactionKind.Refund]: [WagerTransactionKind.Bet],
+  [WagerTransactionKind.Rollback]: [WagerTransactionKind.Bet, WagerTransactionKind.Win, WagerTransactionKind.Refund],
+};
 
 const TERMINAL = new Set([WagerTransactionStatus.Processed, WagerTransactionStatus.Rejected, WagerTransactionStatus.Failed]);
 
@@ -175,6 +183,41 @@ export class WagerTransaction {
 
   matchesPayload(payloadHash: string): boolean {
     return this.payloadHash === payloadHash;
+  }
+
+  /** Esta operação pode ter referência? (BET não referencia nada.) */
+  acceptsReference(): boolean {
+    return ALLOWED_REFERENCE_KINDS[this.kind] !== undefined;
+  }
+
+  /** Regra 3: o tipo da referência é aceito por esta operação. */
+  canReference(kind: WagerTransactionKind): boolean {
+    return ALLOWED_REFERENCE_KINDS[this.kind]?.includes(kind) ?? false;
+  }
+
+  /** Regra 2: mesmo provider, player, wallet, moeda e rodada. */
+  sharesContextWith(reference: WagerTransaction): boolean {
+    return (
+      reference.providerId === this.providerId &&
+      reference.playerId === this.playerId &&
+      reference.walletId === this.walletId &&
+      reference.money.currency === this.money.currency &&
+      reference.roundId === this.roundId
+    );
+  }
+
+  /**
+   * Regras 3 a 5 contra uma referência que já chegou. `referenceAlreadyReversed`: já existe REFUND ou ROLLBACK
+   * PROCESSED desta referência (de qualquer tipo: §3 proíbe crédito duplicado e a tabela do §7 diz "uma única vez").
+   */
+  referenceFailure(reference: WagerTransaction, referenceAlreadyReversed: boolean): FailureCode | undefined {
+    if (reference.status !== WagerTransactionStatus.Processed) return FailureCode.ReferenceNotProcessed;
+    if (!this.canReference(reference.kind)) return FailureCode.ReferenceInvalidKind;
+    // "Já revertida" antes de "valor errado": diz ao provedor para não reenviar. Vale também para WIN/LOSS:
+    // prêmio sobre uma aposta já devolvida pagaria uma aposta que não existe mais.
+    if (referenceAlreadyReversed) return FailureCode.ReferenceAlreadyReversed; // regra 4
+    if (this.requiresReference() && !this.money.equals(reference.money)) return FailureCode.AmountMismatch; // regra 5
+    return undefined;
   }
 
   ledgerDirectionFor(reference?: WagerTransaction): LedgerDirection {
