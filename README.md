@@ -19,7 +19,7 @@ Nada roda sob Node: runtime, testes, migrations e typecheck usam Bun.
 cp .env.example .env
 bun install
 bun run infra:up        # Postgres (porta 5434) + LocalStack (4566) com as 3 filas
-bun run migration:up
+bun run migration:up    # como dono das tabelas (MIGRATION_DATABASE_URL)
 bun run start:dev       # http://localhost:3000
 ```
 
@@ -149,3 +149,6 @@ cada execução, e filas FIFO próprias por execução: nunca tocam o banco nem 
 
 - O LocalStack está fixado em `4.12`: a imagem `latest` passou a exigir auth token.
 - O Postgres usa a porta **5434** do host para não colidir com instalações locais.
+- Dois roles no banco: `wagering` (dono das tabelas, `MIGRATION_DATABASE_URL`, só migrations) e
+  `wagering_app` (`DATABASE_URL`, o app), sem ownership e sem `UPDATE`/`DELETE`/`TRUNCATE` no ledger.
+  Os roles nascem no init do volume do Postgres: num volume antigo, rode `bun run infra:down && bun run infra:up`.

@@ -204,8 +204,8 @@ classes têm construtor privado e factories (`create`/`from`/`open` validam; `re
 
 ### Money
 - `decimal.js` com precisão de 40 dígitos: somas e subtrações de valores com 2 casas nunca arredondam.
-- Entrada (`Money.from`) aceita só `^(0|[1-9]\d{0,17})(\.\d{1,2})?$`: rejeita vazio, espaço, sinal,
-  `NaN`, `Infinity`, notação científica, zero à esquerda, mais de 2 casas e mais de 18 dígitos
+- Entrada (`Money.from`) aceita só `^(0|[1-9]\d{0,17})\.\d{2}$` (escala fixa de 2 casas): rejeita vazio, espaço, sinal,
+  `NaN`, `Infinity`, notação científica, zero à esquerda, menos ou mais de 2 casas (`"25"`, `"25.5"`, `"25.001"`) e mais de 18 dígitos
   inteiros (o limite cabe em `NUMERIC(20,2)`). `amount` precisa ser string: um `number` vindo do JSON é rejeitado.
 - Internamente pode ficar negativo (ex.: diferença da reconciliação). Saída sempre com 2 casas.
 - Moedas diferentes lançam `CurrencyMismatchError`. O modelo é multi-moeda; o desafio usa BRL.
@@ -251,7 +251,8 @@ que falha decide:
      invisível e conta como ausente (`PENDING_REFERENCE`, e `REFERENCE_NOT_FOUND` no fim do prazo).
      De propósito: o id externo é do espaço de nomes de cada provider, e dois providers podem usar o
      mesmo id. Rejeitar na hora porque "existe em outro provider" recusaria uma reversão legítima cuja
-     referência ainda está em voo (regra 8);
+     referência ainda está em voo (regra 8). É a leitura literal das regras 2 e 8: resolvida por
+     `(providerId, …)`, a referência simplesmente não existe para este provider;
    - referência de tipo não permitido (ex.: REFUND de um WIN) → `REFERENCE_INVALID_KIND`, também
      mesmo pendente (o tipo dela não muda esperando);
    - ausente ou ainda não aplicada → `PENDING_REFERENCE`;
@@ -328,7 +329,7 @@ lista é uma migration simples, sem `ALTER TYPE`).
 |---|---|
 | Uma wallet por player + moeda | `UNIQUE (player_id, currency)` |
 | Saldo nunca negativo | `CHECK (balance >= 0)` em `wallets`; `balance_before/after >= 0` no ledger |
-| Ledger imutável | trigger bloqueia `UPDATE`, `DELETE` e `TRUNCATE` |
+| Ledger imutável | trigger bloqueia `UPDATE`, `DELETE` e `TRUNCATE`; o role do app nem tem esses privilégios (ver Roles) |
 | Lançamento coerente | `CHECK` da aritmética `before ± amount = after`; `amount > 0` |
 | Lançamento na moeda da wallet | FK composta `(wallet_id, currency)` → `wallets (id, currency)` |
 | Lançamento bate com a sua transação | FK composta `(transaction_id, wallet_id, amount, currency)` → `wager_transactions` |
@@ -343,6 +344,24 @@ lista é uma migration simples, sem `ALTER TYPE`).
 | Transação é auditável | trigger: linha terminal não muda; nenhuma linha é apagada; campos do payload (os que entram no `payload_hash`) nunca mudam |
 | Status coerente com os campos | `processed_at` ⇔ `PROCESSED`; `failure_code` ⇔ `REJECTED`/`FAILED` |
 | Inbox deduplica | `PRIMARY KEY (consumer_name, message_id)` |
+
+### Roles: migration × runtime
+
+O app **não** conecta como dono das tabelas. `wagering` (dono, `MIGRATION_DATABASE_URL`) só roda
+migrations; o app usa `wagering_app` (`DATABASE_URL`), membro do role de grupo `wagering_runtime`.
+Os dois logins nascem em `docker/postgres/init-roles.sql` (init do volume do Postgres) e os grants
+ficam na migration `Migration20261115130000`:
+
+- `wallets`, `wager_transactions`, `inbox_messages`, `outbox_messages`: `SELECT, INSERT, UPDATE`;
+- `consumer_message_failures`: também `DELETE` (a linha some quando a mensagem tem desfecho);
+- `wallet_ledger_entries`, `ledger_postings`: só `SELECT, INSERT` — append-only também por privilégio.
+
+Sem ownership, o app não consegue `ALTER TABLE … DISABLE TRIGGER`: as garantias do schema (imutabilidade,
+saldo == ledger) não dependem de um role que poderia desligá-las. Um bug ou injeção de SQL no app recebe
+`permission denied` / `must be owner` (testado em `schema.test.ts` conectando como o role do app). Os testes
+de integração e concorrência rodam o app com esse role; só helpers que precisam contornar o banco de
+propósito (`corruptBalance`) conectam como dono. Num volume criado antes deste init script, recrie a infra
+(`bun run infra:down && bun run infra:up`).
 | Replay devolve o saldo daquele momento (regra 7) | `observed_balance` obrigatório em `PROCESSED`/`REJECTED` |
 
 `wager_transactions` **não** tem FK de moeda nem de player com a wallet de propósito: uma transação
@@ -443,6 +462,15 @@ comparação é dela (`idempotencyKey` e `matchesPayload(hash)`):
 - mesma key **e** mesmo hash → replay: a resposta original com `idempotentReplay: true`;
 - qualquer outra coincidência → 409 conflito (nunca replay).
 
+**Escopo da key: por provider** (`UNIQUE (provider_id, idempotency_key)`). O header é a fonte da verdade,
+mas cada provider gera as suas keys sem coordenação com os outros (o default recomendado,
+`"{providerId}:{externalTransactionId}"`, já embute o provider; uma key livre como `"tx-1"` poderia
+coincidir entre dois providers). Global, a colisão acidental viraria 409 para um provider que nunca
+mandou aquela operação; por provider, a key de um não interfere no outro — o mesmo espaço de nomes que
+a regra 2 dá ao id externo. Um provider que troca de `providerId` (migração, rebranding) passa a ser
+outro escopo: as transações antigas continuam consultáveis pelo id antigo, e as reversões delas
+precisam vir com o provider original, como a regra 2 já exige.
+
 A deduplicação é toda no banco (constraints únicas), nada em memória. Corrida com a mesma key
 para wallets diferentes (locks diferentes): a constraint de idempotência estoura, a transação é
 refeita (até 3 vezes) e na segunda passada cai no replay ou no conflito. Só essas duas constraints
@@ -453,7 +481,7 @@ O payload é validado pelo domínio **antes** de pegar o lock: payload inválido
 **Hash do payload:** SHA-256 em hex do JSON canônico — chaves em ordem alfabética, sem espaços,
 campos ausentes omitidos — dos campos de negócio: `providerId`, `externalTransactionId`,
 `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money` e `referenceExternalTransactionId`.
-O `money` passa pelo `Money` antes, então `"25.0"` e `"25.00"` são o mesmo payload. O header
+O `money` entra como `Money.toString()` (a entrada já exige 2 casas, então só há uma grafia por valor). O header
 `Idempotency-Key` e metadados de transporte ficam de fora.
 
 **Regra 7 (saldo observado):** cada transação grava `observed_balance`, o saldo da wallet quando
@@ -588,15 +616,19 @@ Uma regra só decide o destino da mensagem: **ack quando o desfecho está no ban
 
 Cada volta em três passos curtos (claim → commit → publish → mark):
 
-1. **Reserva (lease):** `UPDATE … SET next_attempt_at = agora + 30 s WHERE id IN (SELECT … FOR UPDATE
-   SKIP LOCKED LIMIT 50)` dos pendentes e vencidos, e **commit**. O lock dura só esse UPDATE.
-2. `SendMessageBatch` **fora de transação**, em lotes de 10 (limite do SQS) enviados em paralelo,
-   ordenados por wallet para que os eventos de uma wallet fiquem juntos e em ordem no mesmo lote (`MessageGroupId = walletId`, `MessageDeduplicationId =
-   eventId`): nenhuma conexão do pool nem lock fica preso enquanto o SQS responde.
+1. **Reserva (lease):** trava com `FOR UPDATE SKIP LOCKED` até 50 "cabeças" vencidas — o evento mais
+   antigo ainda não publicado de cada wallet —, reserva (`next_attempt_at = agora + 30 s`) até 50 eventos
+   vencidos dessas wallets e **commita**. O lock dura só essa transação.
+2. `SendMessageBatch` **fora de transação**, em lotes de 10 (limite do SQS), com os eventos de cada
+   wallet juntos e em ordem (`MessageGroupId = walletId`, `MessageDeduplicationId = eventId`). Lotes de
+   wallets diferentes saem em paralelo; lotes da mesma wallet saem em série: nenhuma conexão do pool nem
+   lock fica preso enquanto o SQS responde.
 3. Grava `published_at` ou o próximo retry, só se a reserva ainda for dele (`WHERE next_attempt_at =
    lease`).
 
-- Publishers concorrentes (outras instâncias) reservam lotes disjuntos (teste com dois publishers).
+- Publishers concorrentes (outras instâncias) reservam wallets disjuntas (teste com dois publishers).
+- Pool próprio: o publisher usa um `MikroORM` só dele (até 2 conexões, `OUTBOX_POOL`), então sob
+  saturação do HTTP não espera conexão do pool principal de 10, e não tira conexões do HTTP.
 - Morreu depois de publicar e antes de marcar: a reserva vence em 30 s e o lote é republicado com o
   mesmo `eventId`. A FIFO descarta a duplicata dentro de 5 min; depois disso, o consumidor deduplica
   por `eventId`. Publisher lento que perdeu a reserva não sobrescreve quem a pegou.
@@ -610,10 +642,13 @@ Cada volta em três passos curtos (claim → commit → publish → mark):
   duplicata segura (mesmo `MessageDeduplicationId`). Teste: SQS que aceita a conexão e nunca responde.
 - Busca das vencidas pelo índice parcial `outbox_due_idx (next_attempt_at, occurred_at, id) WHERE
   published_at IS NULL`: com o SQS fora, as pendentes em backoff não são lidas a cada volta.
-- Ordem é melhor esforço: só as entradas recusadas pelo SQS voltam para o retry (as aceitas já
-  estão na fila; reenviá-las só geraria duplicata). Uma recusa, ou lotes de publishers concorrentes,
-  podem publicar eventos da mesma wallet fora de ordem. O consumidor ordena por `walletVersion`
-  (em `WalletBalanceChanged`) e deduplica por `eventId`.
+- **Ordem por wallet é estrita.** Uma wallet só entra numa reserva se a cabeça dela estiver vencida e
+  livre; enquanto um publisher tem a cabeça (reservada, ou em backoff depois de uma recusa), nenhum outro
+  pega eventos posteriores da mesma wallet. Na volta, uma recusa do SQS segura o resto da série daquela
+  wallet (vai junto para o retry). Única brecha: o SQS recusar uma entrada no meio de um lote e aceitar as
+  seguintes da mesma wallet no mesmo lote. A garantia final continua no banco (§8: a ordem do broker é
+  otimização), e o consumidor deduplica por `eventId`. Teste: dois publishers, wallets com mais de um
+  lote de eventos, e a ordem de chegada na FIFO bate com a ordem de gravação na outbox.
 
 ### Referências fora de ordem (§7.1)
 
@@ -666,7 +701,7 @@ concorrência:
     a transação commitou.
 
 **Ambiente.** Uma máquina com 16 CPUs (WSL2), Bun 1.3.13, Postgres 16 e LocalStack 4.12 no Docker.
-O pool padrão é de 10 conexões por instância. Cliente, 3 apps, Postgres e LocalStack disputam a
+O pool principal é de 10 conexões por instância (mais 2 do publisher, desde o pool próprio). Cliente, 3 apps, Postgres e LocalStack disputam a
 mesma CPU.
 
 **Resultado (2026-11-14):**
@@ -691,7 +726,7 @@ lock, outbox lag máx 11,7 s (mediana 7,0 s), 201/201 reconciliadas e com saldo 
 menos vazão que a medição anterior, coerente com os 2 inserts a mais por movimento dentro do lock — mas
 é uma execução de cada lado, então a diferença não está isolada de ruído.
 
-**Depois das correções da avaliação (2026-11-15, 64 clientes, mistura nova com 5% de BET rejeitada):**
+**Depois do replay sem lock e dos triggers de saldo == ledger (2026-11-15, 64 clientes, mistura nova com 5% de BET rejeitada):**
 16.300 requisições, 536 req/s, p50 / p95 / p99 de 75 / 418 / 613 ms, 0% de erro, 0 conflitos de lock,
 819/819 rejeições esperadas voltaram 422 (nenhuma fora do esperado), 201/201 reconciliadas e com saldo ==
 respostas. Replays: p95 199 ms contra 640 ms da hot wallet — o replay sem lock deixou de pegar a fila
@@ -699,6 +734,14 @@ dela. Outbox lag máx 18,1 s (mediana 7,8 s), drenou em 10 s. A vazão caiu de n
 triggers de saldo == ledger e as leituras a mais (replay antes do lock, "já revertida"); o lag não
 melhorou com o lease: o gargalo é o mesmo pool de 10 conexões disputado com o HTTP, não o lock durante
 o envio. Uma execução de cada lado: as diferenças de 628 → 570 → 536 não estão isoladas de ruído.
+
+**Código atual (2026-11-15, 64 clientes, mesma máquina; publisher com reserva de 50, pool próprio e
+ordem estrita por wallet):** 13.309 requisições, 439 req/s, p50 / p95 / p99 de 96 / 514 / 721 ms, hot
+wallet p50 / p99 de 427 / 881 ms, 0% de erro, 0 conflitos de lock, 657/657 rejeições esperadas voltaram
+422, 1.971 replays, **outbox lag máx 0,65 s (mediana 0,2 s)**, drenou 0,3 s depois do fim, 201/201
+reconciliadas e com saldo == respostas. O lag caiu de 18,1 s para 0,65 s: o publisher deixou de disputar
+o pool do HTTP. A vazão menor (536 → 439) vem junto com mais carga concorrente na máquina (outros
+containers locais rodando); uma execução de cada lado, sem isolar ruído.
 
 **Análise.**
 
@@ -716,10 +759,8 @@ o envio. Uma execução de cada lado: as diferenças de 628 → 570 → 536 não
 - **Outbox lag sob saturação.** Com 16 clientes, o evento sai em menos de 1s. Com 64, o publisher
   (na época, lotes de 10, um por vez, por instância) disputava o mesmo pool com as requisições HTTP e
   ficava para trás: até ~12s (18 s na última rodada), e drenava em ~7s quando a carga parava. Nenhum
-  evento se perde, só atrasa. Feito depois dessas medições: reserva de 50 por volta com 5 lotes em
-  paralelo (5× menos idas ao banco por evento). As rodadas acima **não** foram refeitas com essa
-  mudança. Próximos passos se ainda não bastar: um pool próprio para os workers ou mais instâncias de
-  publisher.
+  evento se perde, só atrasa. Feito depois: reserva de 50 por volta (5× menos idas ao banco por evento)
+  e pool próprio para o publisher. Na rodada do código atual o lag máximo foi 0,65 s com 64 clientes.
 - **Correção sob carga.** Zero 5xx, todas as wallets reconciliadas com o ledger e com o saldo
   exato que as respostas prometeram: nenhum débito duplicado ou perdido.
 
@@ -756,8 +797,8 @@ revertida" sem olhar o tipo.
 "uma única vez", e o §3 diz que o sistema não pode duplicar créditos. A regra 4 proíbe o mesmo tipo
 duas vezes, mas não autoriza tipos diferentes; aceitar os dois devolveria a aposta duas vezes,
 contra o §3. A leitura "uma reversão por referência" cumpre as três frases ao mesmo tempo. (A
-primeira versão implementou a leitura literal da regra 4 e documentou o risco; a avaliação
-confirmou o crédito duplo, 150 → 180, e a correção entrou na migration 6.)
+primeira versão implementou a leitura literal da regra 4; um teste mostrou o crédito duplo,
+150 → 180, e a correção entrou na migration 6.)
 
 Consequências:
 
