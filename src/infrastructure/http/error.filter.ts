@@ -6,9 +6,16 @@ import { InvalidMoneyError, InvalidTransactionError } from '../../domain/errors'
 import { requestContext } from './request-context';
 import { InvalidRequestError } from './request-parsing';
 
+const HTTP_CODES: Record<number, string> = {
+  [HttpStatus.BAD_REQUEST]: 'INVALID_REQUEST',
+  [HttpStatus.UNAUTHORIZED]: 'UNAUTHENTICATED',
+  [HttpStatus.FORBIDDEN]: 'FORBIDDEN_PROVIDER',
+  [HttpStatus.SERVICE_UNAVAILABLE]: 'TEMPORARILY_UNAVAILABLE',
+};
+
 /**
  * Um status por situação, igual em todos os endpoints, para o provedor decidir sem ler a mensagem:
- * 400 payload inválido · 404 não existe · 409 conflito · 503 transitório (pode reenviar) · 500 bug.
+ * 400 payload inválido · 401 sem token válido · 403 provedor agindo por outro · 404 não existe · 409 conflito · 503 transitório (pode reenviar) · 500 bug.
  * (422 e 202 não são erro: saem do controller com o resultado da transação.)
  */
 @Catch()
@@ -22,8 +29,10 @@ export class ErrorFilter implements ExceptionFilter {
     const send = (status: number, code: string, message: string) => res.status(status).json({ error: code, message });
 
     if (error instanceof HttpException) {
-      // erros do próprio Nest (rota inexistente, JSON malformado)
-      send(error.getStatus(), error.getStatus() === HttpStatus.BAD_REQUEST ? 'INVALID_REQUEST' : 'HTTP_ERROR', error.message);
+      // erros do próprio Nest (rota inexistente, JSON malformado) e do AuthGuard (401, 403, 503 com o IdP fora)
+      const status = error.getStatus();
+      if (status === HttpStatus.SERVICE_UNAVAILABLE) res.setHeader('Retry-After', '1');
+      send(status, HTTP_CODES[status] ?? 'HTTP_ERROR', error.message);
     } else if (error instanceof InvalidRequestError) {
       send(HttpStatus.BAD_REQUEST, 'INVALID_REQUEST', error.message);
     } else if (error instanceof InvalidMoneyError || error instanceof InvalidTransactionError) {

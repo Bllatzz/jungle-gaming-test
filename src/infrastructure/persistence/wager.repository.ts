@@ -1,16 +1,17 @@
 import { type EntityManager, LockMode } from '@mikro-orm/core';
-import type { PendingReference, WagerStore } from '../../application/ports';
+import type { PendingReference, RecordedWager, WagerStore } from '../../application/ports';
 import type { InboxMessage } from '../../domain/inbox-message';
 import type { WalletLedgerEntry } from '../../domain/ledger-entry';
 import type { Money } from '../../domain/money';
 import type { OutboxMessage } from '../../domain/outbox-message';
-import { type WagerTransaction, type WagerTransactionKind, WagerTransactionStatus } from '../../domain/wager-transaction';
+import { type WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../../domain/wager-transaction';
 import type { Wallet } from '../../domain/wallet';
 import {
   InboxMessageEntity, type InboxMessageRow, LedgerEntryEntity, OutboxMessageEntity, WagerTransactionEntity,
-  type WagerTransactionRow, WalletEntity,
+  WalletEntity,
 } from './entities';
 import * as map from './mappers';
+import { currentTraceparent } from '../observability/tracing';
 
 /** Lock de wallet que demora mais que isso vira erro transitório (503) em vez de pendurar a requisição. */
 const LOCK_TIMEOUT = '5s';
@@ -30,8 +31,20 @@ export class WagerRepository implements WagerStore {
     return row ? map.toWallet(row) : undefined;
   }
 
-  async insertWallet(wallet: Wallet): Promise<void> {
-    await this.em.insert(WalletEntity, map.toWalletRow(wallet));
+  async findWallet(id: string): Promise<Wallet | undefined> {
+    const row = await this.em.findOne(WalletEntity, { id });
+    return row ? map.toWallet(row) : undefined;
+  }
+
+  async insertWallet(wallet: Wallet, open?: { idempotencyKey: string; payloadHash: string }): Promise<void> {
+    await this.em.insert(WalletEntity, {
+      ...map.toWalletRow(wallet), openIdempotencyKey: open?.idempotencyKey ?? null, openPayloadHash: open?.payloadHash ?? null,
+    });
+  }
+
+  async findWalletByOpenKey(idempotencyKey: string): Promise<{ wallet: Wallet; payloadHash: string } | undefined> {
+    const row = await this.em.findOne(WalletEntity, { openIdempotencyKey: idempotencyKey });
+    return row ? { wallet: map.toWallet(row), payloadHash: row.openPayloadHash! } : undefined; // CHECK: key ⇔ hash
   }
 
   async saveWallet(wallet: Wallet): Promise<void> {
@@ -40,12 +53,12 @@ export class WagerRepository implements WagerStore {
   }
 
   /** Transação já gravada com a mesma idempotency key ou o mesmo id externo do provider. */
-  async findExisting(providerId: string, idempotencyKey: string, externalTransactionId: string): Promise<WagerTransactionRow | undefined> {
+  async findExisting(providerId: string, idempotencyKey: string, externalTransactionId: string): Promise<RecordedWager | undefined> {
     const row = await this.em.findOne(WagerTransactionEntity, {
       providerId,
       $or: [{ idempotencyKey }, { externalTransactionId }],
     });
-    return row ?? undefined;
+    return row ? { transaction: map.toWagerTransaction(row), observedBalance: row.observedBalance ?? null } : undefined;
   }
 
   async findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined> {
@@ -53,16 +66,18 @@ export class WagerRepository implements WagerStore {
     return row ? map.toWagerTransaction(row) : undefined;
   }
 
-  /** Regra 4: a referência já foi revertida por uma transação PROCESSED do mesmo kind? */
-  async isReversedBySameKind(referenceTransactionId: string, kind: WagerTransactionKind): Promise<boolean> {
+  /** Regra 4: a referência já tem um REFUND ou ROLLBACK PROCESSED (de qualquer tipo)? */
+  async isReversed(referenceTransactionId: string): Promise<boolean> {
     const count = await this.em.count(WagerTransactionEntity, {
-      referenceTransactionId, kind, status: WagerTransactionStatus.Processed,
+      referenceTransactionId,
+      kind: { $in: [WagerTransactionKind.Refund, WagerTransactionKind.Rollback] },
+      status: WagerTransactionStatus.Processed,
     });
     return count > 0;
   }
 
-  async insertTransaction(transaction: WagerTransaction, observedBalance: Money): Promise<void> {
-    await this.em.insert(WagerTransactionEntity, map.toWagerTransactionRow(transaction, observedBalance));
+  async insertTransaction(transaction: WagerTransaction, observedBalance: Money, correlationId: string): Promise<void> {
+    await this.em.insert(WagerTransactionEntity, { ...map.toWagerTransactionRow(transaction, observedBalance), correlationId });
   }
 
   async appendLedgerEntry(entry: WalletLedgerEntry, walletVersion: number): Promise<void> {
@@ -70,7 +85,9 @@ export class WagerRepository implements WagerStore {
   }
 
   async enqueue(messages: OutboxMessage[]): Promise<void> {
-    if (messages.length > 0) await this.em.insertMany(OutboxMessageEntity, messages.map(map.toOutboxMessageRow));
+    // o trace de quem gravou segue com o evento (tracing.ts); null com o tracing desligado
+    const traceparent = currentTraceparent() ?? null;
+    if (messages.length > 0) await this.em.insertMany(OutboxMessageEntity, messages.map((m) => ({ ...map.toOutboxMessageRow(m), traceparent })));
   }
 
   async findInbox(consumerName: string, messageId: string): Promise<InboxMessageRow | undefined> {
@@ -82,22 +99,39 @@ export class WagerRepository implements WagerStore {
   }
 
   /**
-   * Eventos pendentes e vencidos, travados com SKIP LOCKED: publishers concorrentes pegam lotes
-   * disjuntos, e o lock vale até o commit (que grava publishedAt ou o próximo retry).
+   * Reserva (lease) até `limit` eventos pendentes e vencidos: empurra next_attempt_at para `until` e devolve as
+   * linhas. SKIP LOCKED: publishers concorrentes reservam lotes disjuntos. O lock dura só este UPDATE — quem
+   * chama commita antes de falar com o SQS; a reserva vale até `until` (publisher que morreu solta sozinho).
    */
-  async claimDueOutbox(now: Date, limit: number): Promise<OutboxMessage[]> {
-    const rows = await this.em.find(
-      OutboxMessageEntity,
-      { publishedAt: null, $or: [{ nextAttemptAt: null }, { nextAttemptAt: { $lte: now } }] },
-      { orderBy: { occurredAt: 'asc', id: 'asc' }, limit, lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE },
+  async claimDueOutbox(now: Date, until: Date, limit: number): Promise<{ message: OutboxMessage; traceparent: string | null }[]> {
+    const ids = await this.em.getConnection().execute<{ id: string }[]>(
+      `update outbox_messages set next_attempt_at = ?
+        where id in (select id from outbox_messages
+                      where published_at is null and (next_attempt_at is null or next_attempt_at <= ?)
+                      order by occurred_at, id
+                      limit ? for update skip locked)
+        returning id`,
+      [until, now, limit], 'all', this.em.getTransactionContext(),
     );
-    return rows.map(map.toOutboxMessage);
+    if (ids.length === 0) return [];
+    const rows = await this.em.find(
+      OutboxMessageEntity, { id: { $in: ids.map((r: { id: string }) => r.id) } }, { orderBy: { occurredAt: 'asc', id: 'asc' } },
+    );
+    return rows.map((row) => ({ message: map.toOutboxMessage(row), traceparent: row.traceparent ?? null }));
   }
 
-  async saveOutbox(messages: OutboxMessage[]): Promise<void> {
+  /**
+   * Grava publishedAt ou o próximo retry, só se a reserva ainda for deste publisher (next_attempt_at = `leasedUntil`).
+   * Reserva vencida e pega por outro: não sobrescreve (o evento sai de novo — duplicata segura, mesmo eventId).
+   */
+  async saveOutbox(messages: OutboxMessage[], leasedUntil: Date): Promise<void> {
     for (const message of messages) {
       const { attempts, nextAttemptAt, publishedAt } = map.toOutboxMessageRow(message);
-      await this.em.nativeUpdate(OutboxMessageEntity, { id: message.id }, { attempts, nextAttemptAt, publishedAt });
+      await this.em.nativeUpdate(
+        OutboxMessageEntity,
+        { id: message.id, publishedAt: null, nextAttemptAt: leasedUntil },
+        { attempts, nextAttemptAt, publishedAt },
+      );
     }
   }
 
@@ -129,7 +163,10 @@ export class WagerRepository implements WagerStore {
   async findPendingReference(id: string): Promise<PendingReference | undefined> {
     const row = await this.em.findOne(WagerTransactionEntity, { id, status: WagerTransactionStatus.PendingReference });
     return row
-      ? { transaction: map.toWagerTransaction(row), attempts: row.referenceAttempts, nextAttemptAt: row.nextReferenceAttemptAt ?? null }
+      ? {
+          transaction: map.toWagerTransaction(row), attempts: row.referenceAttempts,
+          nextAttemptAt: row.nextReferenceAttemptAt ?? null, correlationId: row.correlationId ?? null,
+        }
       : undefined;
   }
 

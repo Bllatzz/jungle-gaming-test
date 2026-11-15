@@ -35,6 +35,13 @@ export function wagerPayloadHash(payload: WagerPayload): string {
   return createHash('sha256').update(canonicalJson(business)).digest('hex');
 }
 
+/** Mesmo esquema para a abertura de wallet (POST /wallets com Idempotency-Key). */
+export function openWalletPayloadHash(command: { playerId: string; initialBalance: Money }): string {
+  return createHash('sha256')
+    .update(canonicalJson({ playerId: command.playerId, initialBalance: command.initialBalance.toJSON() }))
+    .digest('hex');
+}
+
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;

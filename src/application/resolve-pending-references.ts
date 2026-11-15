@@ -1,8 +1,10 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { WagerTransactionFailed } from '../domain/events/wager-events';
 import { FailureCode } from '../domain/failure-codes';
+import { OutboxMessage } from '../domain/outbox-message';
 import { applyWager, type WagerDecision } from '../domain/wager-rules';
 import type { WagerTransaction } from '../domain/wager-transaction';
-import { MetricsRecorder, UnitOfWork, type WagerStore } from './ports';
+import type { AppLogger, MetricsRecorder, PendingReference, UnitOfWork, WagerStore } from './ports';
+import { eventContext } from './event-context';
 import { recordDecision } from './wager-outcome';
 
 /**
@@ -12,12 +14,15 @@ import { recordDecision } from './wager-outcome';
 export const MAX_REFERENCE_ATTEMPTS = 10;
 const MAX_DELAY_MS = 60_000;
 const BATCH = 20;
-/** Linha que deu erro (não regra de negócio) volta só depois disso: não trava as outras nem gira em loop. */
+/** Falha transitória (banco fora, lock timeout): a linha volta depois disso sem gastar tentativa. */
 const ERROR_DELAY_MS = 60_000;
 /** Reserva de um lote: maior que o pior caso de 20 linhas esperando o lock da wallet (5 s cada). */
 const CLAIM_MS = 120_000;
 
 type Outcome = { transaction: WagerTransaction; attempts: number; stillPending: boolean };
+
+/** Eventos do worker carregam o correlationId de quem enviou (linhas antigas, sem ele: o id da transação). */
+const requestOf = (pending: PendingReference) => ({ correlationId: pending.correlationId ?? pending.transaction.id });
 
 export function nextReferenceAttemptAt(attempts: number, now: Date): Date {
   return new Date(now.getTime() + Math.min(1_000 * 2 ** (attempts - 1), MAX_DELAY_MS));
@@ -28,13 +33,11 @@ export function nextReferenceAttemptAt(attempts: number, now: Date): Date {
  * sob o lock da wallet. Várias instâncias podem rodar: cada volta reserva um lote com SKIP LOCKED, então
  * as instâncias não varrem as mesmas linhas, e a linha relida sob o lock só é tratada se a reserva ainda for dela.
  */
-@Injectable()
 export class ResolvePendingReferences {
-  private readonly logger = new Logger(ResolvePendingReferences.name);
-
   constructor(
     private readonly uow: UnitOfWork,
     private readonly metrics: MetricsRecorder,
+    private readonly logger: AppLogger,
   ) {}
 
   /** Uma volta. Devolve quantas transações reavaliou (0 = nada a fazer: o loop descansa). */
@@ -48,12 +51,19 @@ export class ResolvePendingReferences {
       try {
         outcome = await this.uow.transaction((store) => this.resolve(store, id, walletId, claimedUntil));
       } catch (error) {
-        // erro de infraestrutura ou bug: adia a linha (sem gastar tentativa) para não travar as outras
         this.logger.error({ msg: 'pending reference retry failed', transactionId: id, walletId, error: (error as Error).message });
-        await this.uow
-          .transaction((store) => store.postponePendingReference(id, new Date(Date.now() + ERROR_DELAY_MS)))
-          .catch(() => undefined); // banco fora: a próxima volta tenta de novo
-        continue;
+        // Transitório: adia sem gastar tentativa (vai passar sozinho). Qualquer outro erro (bug, dado que o código
+        // não sabe tratar) gasta uma tentativa como a referência ausente: esgotadas, a transação termina em FAILED
+        // com INTERNAL_ERROR e evento, em vez de ficar pendente para sempre sem desfecho para o provedor.
+        outcome = this.uow.isTransient(error)
+          ? undefined
+          : await this.uow.transaction((store) => this.recordFailure(store, id, walletId, claimedUntil)).catch(() => undefined);
+        if (!outcome) {
+          await this.uow
+            .transaction((store) => store.postponePendingReference(id, new Date(Date.now() + ERROR_DELAY_MS)))
+            .catch(() => undefined); // banco fora: a próxima volta tenta de novo
+          continue;
+        }
       }
       if (!outcome) continue;
       evaluated++;
@@ -84,7 +94,7 @@ export class ResolvePendingReferences {
       wallet,
       transaction,
       reference,
-      referenceAlreadyReversedBySameKind: reference ? await repo.isReversedBySameKind(reference.id, transaction.kind) : false,
+      referenceAlreadyReversed: reference ? await repo.isReversed(reference.id) : false,
       ledgerEntryId: Bun.randomUUIDv7(),
       now,
     });
@@ -103,7 +113,25 @@ export class ResolvePendingReferences {
       nextAttemptAt: stillPending ? nextReferenceAttemptAt(attempts, now) : null,
     });
     // ainda pendente: o evento PendingReference já saiu na primeira vez
-    if (!stillPending) await recordDecision(repo, transaction, wallet, decision, { correlationId: transaction.id }, now);
+    if (!stillPending) await recordDecision(repo, transaction, wallet, decision, requestOf(pending), now);
     return { transaction, attempts, stillPending };
+  }
+
+  /** Erro não transitório ao reavaliar: gasta uma tentativa; na última, FAILED com INTERNAL_ERROR e evento. */
+  private async recordFailure(repo: WagerStore, id: string, walletId: string, claimedUntil: Date): Promise<Outcome | undefined> {
+    const wallet = await repo.lockWallet(walletId);
+    const pending = await repo.findPendingReference(id);
+    if (!wallet || !pending || pending.nextAttemptAt?.getTime() !== claimedUntil.getTime()) return undefined;
+    const { transaction } = pending;
+    const attempts = pending.attempts + 1;
+    const now = new Date();
+    const exhausted = attempts >= MAX_REFERENCE_ATTEMPTS;
+    if (exhausted) transaction.fail(FailureCode.InternalError);
+    await repo.updatePendingTransaction(transaction, wallet.balance, {
+      attempts,
+      nextAttemptAt: exhausted ? null : nextReferenceAttemptAt(attempts, now),
+    });
+    if (exhausted) await repo.enqueue([OutboxMessage.enqueue(WagerTransactionFailed.from(transaction, eventContext(requestOf(pending), now)()))]);
+    return { transaction, attempts, stillPending: !exhausted };
   }
 }

@@ -3,7 +3,7 @@ import { Injectable } from '@nestjs/common';
 import { UniqueViolationError } from '../../application/errors';
 import { type WagerStore, UnitOfWork } from '../../application/ports';
 import { Metrics } from '../observability/metrics';
-import { lockConflict, violatedConstraint } from './transient-errors';
+import { isTransient, lockConflict, violatedConstraint } from './transient-errors';
 import { WagerRepository } from './wager.repository';
 
 /** UnitOfWork sobre em.transactional() do MikroORM: o WagerRepository recebe o EntityManager da transação. */
@@ -26,5 +26,9 @@ export class MikroUnitOfWork extends UnitOfWork {
       if (error instanceof UniqueConstraintViolationException) throw new UniqueViolationError(violatedConstraint(error), { cause: error });
       throw error;
     }
+  }
+
+  isTransient(error: unknown): boolean {
+    return isTransient(error);
   }
 }

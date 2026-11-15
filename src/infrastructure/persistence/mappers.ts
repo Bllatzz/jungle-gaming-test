@@ -11,7 +11,8 @@ import type { InboxMessageRow, LedgerEntryRow, OutboxMessageRow, WagerTransactio
 
 const money = (amount: string, currency: string) => Money.from({ amount, currency });
 
-export function toWalletRow(wallet: Wallet): WalletRow {
+/** Sem as colunas da abertura idempotente: só o insert da abertura as grava (WagerRepository.insertWallet). */
+export function toWalletRow(wallet: Wallet): Omit<WalletRow, 'openIdempotencyKey' | 'openPayloadHash'> {
   return {
     id: wallet.id,
     playerId: wallet.playerId,
@@ -28,7 +29,10 @@ export function toWallet(row: WalletRow): Wallet {
 }
 
 /** observedBalance: saldo da wallet quando a transação foi decidida (regra 7, replay). */
-export function toWagerTransactionRow(transaction: WagerTransaction, observedBalance: Money | undefined): WagerTransactionRow {
+/** Sem correlation_id: não é do domínio, o repositório grava junto no insert. */
+export function toWagerTransactionRow(
+  transaction: WagerTransaction, observedBalance: Money | undefined,
+): Omit<WagerTransactionRow, 'correlationId'> {
   const { money: value, referenceExternalTransactionId, referenceTransactionId, failureCode, processedAt, ...rest } =
     transaction.toState();
   return {
@@ -98,7 +102,8 @@ export function toInboxMessage(row: InboxMessageRow): InboxMessage {
   return InboxMessage.rehydrate({ ...row, processedAt: row.processedAt ?? undefined });
 }
 
-export function toOutboxMessageRow(message: OutboxMessage): OutboxMessageRow {
+/** Sem traceparent: não é do domínio, o repositório grava junto no insert. */
+export function toOutboxMessageRow(message: OutboxMessage): Omit<OutboxMessageRow, 'traceparent'> {
   return {
     id: message.id,
     aggregateId: message.aggregateId,

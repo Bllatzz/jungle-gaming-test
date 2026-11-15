@@ -18,6 +18,8 @@ export const WalletEntity = defineEntity({
     version: p.integer(),
     createdAt: p.datetime(),
     updatedAt: p.datetime(),
+    openIdempotencyKey: p.text().nullable(),
+    openPayloadHash: p.text().nullable(),
   },
 });
 export type WalletRow = InferEntity<typeof WalletEntity>;
@@ -47,6 +49,7 @@ export const WagerTransactionEntity = defineEntity({
     observedBalance: p.decimal('string').precision(20).scale(2).nullable(),
     referenceAttempts: p.integer().default(0),
     nextReferenceAttemptAt: p.datetime().nullable(),
+    correlationId: p.text().nullable(),
   },
 });
 export type WagerTransactionRow = InferEntity<typeof WagerTransactionEntity>;
@@ -94,6 +97,7 @@ export const OutboxMessageEntity = defineEntity({
     attempts: p.integer().default(0),
     nextAttemptAt: p.datetime().nullable(),
     publishedAt: p.datetime().nullable(),
+    traceparent: p.text().nullable(),
   },
 });
 export type OutboxMessageRow = InferEntity<typeof OutboxMessageEntity>;

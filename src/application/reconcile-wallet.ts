@@ -1,7 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
 import { Money } from '../domain/money';
 import { NotFoundError } from './errors';
-import { MetricsRecorder, ReconciliationSource } from './ports';
+import type { AppLogger, MetricsRecorder, ReconciliationSource } from './ports';
 
 export interface ReconciliationResult {
   walletId: string;
@@ -13,13 +12,11 @@ export interface ReconciliationResult {
 }
 
 /** Confere saldo gravado × saldo reconstruído pelo ledger. Divergência é sinalizada, nunca corrigida. */
-@Injectable()
 export class ReconcileWallet {
-  private readonly logger = new Logger(ReconcileWallet.name);
-
   constructor(
     private readonly queries: ReconciliationSource,
     private readonly metrics: MetricsRecorder,
+    private readonly logger: AppLogger,
   ) {}
 
   async execute(walletId: string): Promise<ReconciliationResult> {
@@ -36,5 +33,18 @@ export class ReconcileWallet {
       this.logger.error({ msg: 'wallet balance diverges from ledger', walletId, difference: difference.toString() });
     }
     return { walletId, storedBalance: wallet.balance, calculatedBalance, difference, consistent, checkedEntries: entries };
+  }
+
+  /**
+   * Varredura periódica do banco inteiro (worker). Os triggers já impedem a divergência; isto pega o caso de
+   * alguém contornar o banco (trigger desligado, restore parcial). Sinaliza (métrica + log), nunca corrige.
+   */
+  async sweep(): Promise<number> {
+    const diverging = await this.queries.divergingWallets();
+    for (const d of diverging) {
+      this.metrics.inc('reconciliation_divergences_total');
+      this.logger.error({ msg: 'wallet balance diverges from ledger (sweep)', ...d });
+    }
+    return diverging.length;
   }
 }

@@ -32,9 +32,21 @@ export class WagerQueries implements ReconciliationSource {
     return row ? map.toWallet(row) : undefined;
   }
 
-  /** Página do histórico em ordem de wallet_version (estritamente crescente por wallet). */
-  async ledgerPage(walletId: string, afterVersion: number, limit: number): Promise<{ rows: LedgerEntryRow[]; hasMore: boolean }> {
-    const rows = await this.orm.em.fork().find(
+  /**
+   * Página do histórico em ordem de wallet_version (estritamente crescente por wallet), depois do lançamento
+   * `afterEntryId`. undefined: o cursor não é um lançamento desta wallet.
+   */
+  async ledgerPage(
+    walletId: string, afterEntryId: string | undefined, limit: number,
+  ): Promise<{ rows: LedgerEntryRow[]; hasMore: boolean } | undefined> {
+    const em = this.orm.em.fork();
+    let afterVersion = 0;
+    if (afterEntryId) {
+      const cursor = await em.findOne(LedgerEntryEntity, { id: afterEntryId, walletId });
+      if (!cursor) return undefined;
+      afterVersion = cursor.walletVersion;
+    }
+    const rows = await em.find(
       LedgerEntryEntity,
       { walletId, walletVersion: { $gt: afterVersion } },
       { orderBy: { walletVersion: 'asc' }, limit: limit + 1 },
@@ -69,6 +81,32 @@ export class WagerQueries implements ReconciliationSource {
           [walletId], 'all', em.getTransactionContext(),
         );
         return { wallet: map.toWallet(row), credits: sums!.credits, debits: sums!.debits, entries: Number(sums!.entries) };
+      },
+      { isolationLevel: IsolationLevel.REPEATABLE_READ, readOnly: true },
+    );
+  }
+
+  /**
+   * Varredura do banco inteiro (job periódico de auditoria): wallets cujo saldo diverge do ledger ou das
+   * partidas dobradas. Com os triggers da migration 7 o resultado é vazio; só aparece algo se alguém contornou
+   * o banco (trigger desligado, restore parcial). Uma foto só (REPEATABLE READ) e timeout para não pesar.
+   */
+  async divergingWallets(): Promise<{ walletId: string; balance: string; ledgerBalance: string; postingsBalance: string }[]> {
+    return this.orm.em.fork().transactional(
+      async (em) => {
+        const ctx = em.getTransactionContext();
+        await em.getConnection().execute(`set local statement_timeout = '30s'`, [], 'run', ctx);
+        return em.getConnection().execute(
+          `select w.id as "walletId", w.balance::text as balance,
+                  coalesce(l.net, 0)::text as "ledgerBalance", coalesce(p.net, 0)::text as "postingsBalance"
+             from wallets w
+             left join (select wallet_id, sum(case direction when 'CREDIT' then amount else -amount end) as net
+                          from wallet_ledger_entries group by wallet_id) l on l.wallet_id = w.id
+             left join (select account, sum(case direction when 'CREDIT' then amount else -amount end) as net
+                          from ledger_postings group by account) p on p.account = 'wallet:' || w.id
+            where w.balance <> coalesce(l.net, 0) or w.balance <> coalesce(p.net, 0)`,
+          [], 'all', ctx,
+        );
       },
       { isolationLevel: IsolationLevel.REPEATABLE_READ, readOnly: true },
     );
