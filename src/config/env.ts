@@ -2,6 +2,8 @@
 export type Env = {
   port: number;
   databaseUrl: string;
+  /** Dono das tabelas, usado só pelas migrations. Ausente: o mesmo DATABASE_URL. */
+  migrationDatabaseUrl: string;
   awsRegion: string;
   awsEndpointUrl: string;
   awsAccessKeyId: string;
@@ -47,6 +49,7 @@ export function loadEnv(source: Record<string, string | undefined>): Env {
   return {
     port,
     databaseUrl: required('DATABASE_URL'),
+    migrationDatabaseUrl: source.MIGRATION_DATABASE_URL?.trim() || required('DATABASE_URL'),
     awsRegion: required('AWS_REGION'),
     awsEndpointUrl: required('AWS_ENDPOINT_URL'),
     awsAccessKeyId: required('AWS_ACCESS_KEY_ID'),

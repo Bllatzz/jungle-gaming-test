@@ -23,19 +23,25 @@ import {
 } from '../../src/infrastructure/persistence/entities';
 import * as map from '../../src/infrastructure/persistence/mappers';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
-import { freshTestDatabase } from '../support/test-database';
+import { asOwner, freshTestDatabase } from '../support/test-database';
 
 const NOW = new Date('2026-11-14T12:00:00.000Z');
 const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
 // saldo observado só importa para o replay (parte 4); aqui qualquer valor válido serve
 const txRow = (t: WagerTransaction) => map.toWagerTransactionRow(t, brl('100.00'));
-let orm: MikroORM;
+let orm: MikroORM; // dono das tabelas: aplica migrations e tenta violar constraints direto
+let runtime: MikroORM; // role do app (wagering_app): sem ownership
 
 beforeAll(async () => {
-  orm = await MikroORM.init(createOrmConfig(await freshTestDatabase('schema')));
+  const env = await freshTestDatabase('schema');
+  orm = await MikroORM.init(createOrmConfig(asOwner(env)));
   await orm.migrator.up();
+  runtime = await MikroORM.init(createOrmConfig(env));
 });
-afterAll(() => orm.close());
+afterAll(async () => {
+  await runtime.close();
+  await orm.close();
+});
 
 /** Wallet aberta com 100.00 BRL + transação OPENING + lançamento, gravados juntos. */
 async function seedWallet() {
@@ -508,6 +514,30 @@ describe('wallet_ledger_entries', () => {
       amount: '5.00', currency: 'USD', balanceBefore: '100.00', balanceAfter: '105.00', walletVersion: 2, createdAt: NOW,
     };
     await expect(insert(LedgerEntryEntity, row)).rejects.toBeInstanceOf(ForeignKeyConstraintViolationException);
+  });
+});
+
+describe('role de runtime (sem ownership)', () => {
+  test('o app não é dono das tabelas', async () => {
+    const [{ user }] = await runtime.em.getConnection().execute<{ user: string }[]>('select current_user as user');
+    const [{ owner }] = await orm.em.getConnection().execute<{ owner: string }[]>(
+      `select tableowner as owner from pg_tables where tablename = 'wallet_ledger_entries'`);
+    expect(user).not.toBe(owner);
+  });
+
+  test('não consegue alterar, apagar nem truncar o ledger e as partidas dobradas', async () => {
+    const conn = runtime.em.getConnection();
+    for (const table of ['wallet_ledger_entries', 'ledger_postings']) {
+      await expect(conn.execute(`update ${table} set created_at = now()`)).rejects.toThrow('permission denied');
+      await expect(conn.execute(`delete from ${table}`)).rejects.toThrow('permission denied');
+      await expect(conn.execute(`truncate ${table}`)).rejects.toThrow('permission denied');
+    }
+  });
+
+  test('não consegue desligar os triggers que guardam as invariantes', async () => {
+    const conn = runtime.em.getConnection();
+    await expect(conn.execute('alter table wallets disable trigger wallets_match_ledger')).rejects.toThrow('must be owner');
+    await expect(conn.execute('alter table wallet_ledger_entries disable trigger all')).rejects.toThrow('must be owner');
   });
 });
 

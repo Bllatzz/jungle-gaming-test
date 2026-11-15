@@ -1,3 +1,20 @@
+x-app-env: &app-env
+  PORT: "3000"
+  # role de runtime: não é dono das tabelas (ver docker/postgres/init-roles.sql)
+  DATABASE_URL: postgres://wagering_app:wagering_app@postgres:5432/wagering
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://localstack:4566
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_WAGER_QUEUE: wager-transactions.fifo
+  SQS_WAGER_DLQ: wager-transactions-dlq.fifo
+  SQS_EVENTS_QUEUE: wallet-events.fifo
+  # Vazias = auth desligada. Com o Keycloak (perfil auth), ver README → Autenticação.
+  AUTH_ISSUER: ${AUTH_ISSUER:-}
+  AUTH_JWKS_URL: ${AUTH_JWKS_URL:-}
+  # Vazia = tracing desligado. Com o perfil observability: http://jaeger:4318
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -5,6 +22,9 @@ services:
       POSTGRES_DB: wagering
       POSTGRES_USER: wagering
       POSTGRES_PASSWORD: wagering
+    volumes:
+      # role de runtime (wagering_app) separado do dono das tabelas (wagering, só migrations)
+      - ./docker/postgres/init-roles.sql:/docker-entrypoint-initdb.d/init-roles.sql:ro
     # 5434 no host: 5432/5433 costumam estar ocupadas por um Postgres local.
     ports: ["127.0.0.1:5434:5432"]
     healthcheck:
@@ -32,21 +52,10 @@ services:
     image: wagering-processor # mesma imagem do app (um build só)
     build: .
     command: ["bun", "run", "migration:up"]
-    environment: &app-env
-      PORT: "3000"
-      DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
-      AWS_REGION: us-east-1
-      AWS_ENDPOINT_URL: http://localstack:4566
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      SQS_WAGER_QUEUE: wager-transactions.fifo
-      SQS_WAGER_DLQ: wager-transactions-dlq.fifo
-      SQS_EVENTS_QUEUE: wallet-events.fifo
-      # Vazias = auth desligada. Com o Keycloak (perfil auth), ver README → Autenticação.
-      AUTH_ISSUER: ${AUTH_ISSUER:-}
-      AUTH_JWKS_URL: ${AUTH_JWKS_URL:-}
-      # Vazia = tracing desligado. Com o perfil observability: http://jaeger:4318
-      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    environment:
+      <<: *app-env
+      # só o migrate conecta como dono das tabelas; o app usa o role de runtime
+      MIGRATION_DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
     depends_on:
       postgres: { condition: service_healthy }
     restart: "no"

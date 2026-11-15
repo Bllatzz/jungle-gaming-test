@@ -167,7 +167,7 @@ describe('métricas', () => {
 
   test('divergência de reconciliação: sinalizada, logada e contada (nunca corrigida)', async () => {
     const wallet = await api.openWallet(url, '100.00');
-    await corruptBalance(orm, wallet.id, '90.00'); // corrompe o saldo contornando o banco
+    await corruptBalance(queues.env, wallet.id, '90.00'); // corrompe o saldo contornando o banco
     expect(await api.reconcile(url, wallet.id)).toMatchObject({ consistent: false });
     expect((await scrape()).value('reconciliation_divergences_total')).toBe(1);
     expect(logs.some((l) => l.level === 'error' && l.msg === 'wallet balance diverges from ledger' && l.walletId === wallet.id)).toBe(true);

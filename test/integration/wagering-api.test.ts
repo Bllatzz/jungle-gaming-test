@@ -342,7 +342,7 @@ describe('consultas', () => {
     // o schema recusa a adulteração direta (migration 7)...
     await expect(orm.em.getConnection().execute(`update wallets set balance = 90 where id = ?`, [wallet.id])).rejects.toThrow('does not match');
     // ...então adultera contornando o banco (trigger desligado), o caso que a reconciliação existe para pegar
-    await corruptBalance(orm, wallet.id, '90.00');
+    await corruptBalance(env, wallet.id, '90.00');
     const rec = await call('POST', `/wallets/${wallet.id}/reconciliation`);
     expect(rec.body).toMatchObject({
       consistent: false, storedBalance: { amount: '90.00' }, calculatedBalance: { amount: '100.00' }, difference: { amount: '-10.00' },

@@ -10,9 +10,10 @@ import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.
 export async function freshTestDatabase(suite: string, migrate = false): Promise<Env> {
   const env = loadEnv(process.env);
   const url = new URL(env.databaseUrl);
-  const name = `${url.pathname.slice(1)}_test_${suite}`;
+  const ownerUrl = new URL(env.migrationDatabaseUrl);
+  const name = `${ownerUrl.pathname.slice(1)}_test_${suite}`;
   if (!/^\w+$/.test(name)) throw new Error(`Nome de banco inesperado: ${name}`);
-  const admin = await MikroORM.init(createOrmConfig(env));
+  const admin = await MikroORM.init(createOrmConfig(asOwner(env)));
   try {
     await admin.em.getConnection().execute(`drop database if exists ${name} with (force)`);
     await admin.em.getConnection().execute(`create database ${name}`);
@@ -20,14 +21,19 @@ export async function freshTestDatabase(suite: string, migrate = false): Promise
     await admin.close();
   }
   url.pathname = `/${name}`;
-  // workers desligados: um teste que quer consumer/publisher chama as voltas direto (determinístico)
-  const testEnv = { ...env, databaseUrl: url.toString(), workersEnabled: false };
+  ownerUrl.pathname = `/${name}`;
+  // workers desligados: um teste que quer consumer/publisher chama as voltas direto (determinístico).
+  // O app dos testes conecta com o role de runtime, como em produção; as migrations, como dono.
+  const testEnv = { ...env, databaseUrl: url.toString(), migrationDatabaseUrl: ownerUrl.toString(), workersEnabled: false };
   if (migrate) {
-    const orm = await MikroORM.init(createOrmConfig(testEnv));
+    const orm = await MikroORM.init(createOrmConfig(asOwner(testEnv)));
     await orm.migrator.up().finally(() => orm.close());
   }
   return testEnv;
 }
+
+/** Mesmo Env conectando como dono das tabelas (migrations, DDL, contornar o banco de propósito). */
+export const asOwner = (env: Env): Env => ({ ...env, databaseUrl: env.migrationDatabaseUrl });
 
 /**
  * Invariante final (§13) de uma vez, para o banco inteiro da suíte: wallets cujo saldo ≠ saldo reconstruído
@@ -45,15 +51,20 @@ export async function walletsDivergingFromLedger(orm: MikroORM): Promise<{ id: s
 }
 
 /**
- * Corrompe o saldo de uma wallet "por fora", como um operador que contornou o banco: desliga o trigger que
- * amarra saldo e ledger (migration 7) só nesta transação. É a única forma de produzir a divergência que a
- * reconciliação e a auditoria precisam detectar.
+ * Corrompe o saldo de uma wallet "por fora", como um operador que contornou o banco: conecta como dono das
+ * tabelas (o role do app não pode) e desliga o trigger que amarra saldo e ledger (migration 7) só nesta
+ * transação. É a única forma de produzir a divergência que a reconciliação e a auditoria precisam detectar.
  */
-export async function corruptBalance(orm: MikroORM, walletId: string, balance: string): Promise<void> {
-  await orm.em.fork().transactional(async (em) => {
-    const run = (sql: string, params: unknown[] = []) => em.getConnection().execute(sql, params, 'run', em.getTransactionContext());
-    await run('alter table wallets disable trigger wallets_match_ledger');
-    await run('update wallets set balance = ? where id = ?', [balance, walletId]);
-    await run('alter table wallets enable trigger wallets_match_ledger');
-  });
+export async function corruptBalance(env: Env, walletId: string, balance: string): Promise<void> {
+  const owner = await MikroORM.init(createOrmConfig(asOwner(env)));
+  try {
+    await owner.em.fork().transactional(async (em) => {
+      const run = (sql: string, params: unknown[] = []) => em.getConnection().execute(sql, params, 'run', em.getTransactionContext());
+      await run('alter table wallets disable trigger wallets_match_ledger');
+      await run('update wallets set balance = ? where id = ?', [balance, walletId]);
+      await run('alter table wallets enable trigger wallets_match_ledger');
+    });
+  } finally {
+    await owner.close();
+  }
 }

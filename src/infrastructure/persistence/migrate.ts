@@ -12,7 +12,9 @@ if (!['create', 'up', 'down'].includes(command ?? '')) {
 }
 /** Chave do advisory lock: dois `migration:up` ao mesmo tempo (deploys, réplicas) rodam um depois do outro. */
 const MIGRATION_LOCK_KEY = 7_201_114;
-const env = loadEnv(process.env);
+// migrations rodam como dono das tabelas; o app conecta com o role de runtime (sem ownership)
+const loaded = loadEnv(process.env);
+const env = { ...loaded, databaseUrl: loaded.migrationDatabaseUrl };
 let orm: MikroORM | undefined;
 // conexão própria e reservada: o lock é de sessão e vive até ela fechar (inclusive se o processo morrer)
 const lockClient = new SQL(env.databaseUrl);

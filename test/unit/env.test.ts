@@ -22,6 +22,14 @@ test('carrega env válida', () => {
   for (const WORKERS_ENABLED of ['FALSE', '0', 'no']) expect(() => loadEnv({ ...valid, WORKERS_ENABLED })).toThrow('WORKERS_ENABLED');
 });
 
+test('migrations usam MIGRATION_DATABASE_URL (dono das tabelas); sem ela, o DATABASE_URL', () => {
+  expect(loadEnv(valid).migrationDatabaseUrl).toBe(valid.DATABASE_URL);
+  const owner = 'postgres://owner:p@h:5432/db';
+  const env = loadEnv({ ...valid, MIGRATION_DATABASE_URL: owner });
+  expect(env.migrationDatabaseUrl).toBe(owner);
+  expect(env.databaseUrl).toBe(valid.DATABASE_URL);
+});
+
 test('falha nomeando a variável ausente', () => {
   const { DATABASE_URL: _, ...rest } = valid;
   expect(() => loadEnv(rest)).toThrow('DATABASE_URL');
