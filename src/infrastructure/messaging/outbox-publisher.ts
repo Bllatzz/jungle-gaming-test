@@ -1,7 +1,7 @@
 import { SendMessageBatchCommand } from '@aws-sdk/client-sqs';
-import { MikroORM } from '@mikro-orm/core';
+import type { MikroORM } from '@mikro-orm/core';
 import type { OutboxMessage } from '../../domain/outbox-message';
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, type OnApplicationShutdown } from '@nestjs/common';
 import { ENV, type Env } from '../../config/env';
 import { Metrics } from '../observability/metrics';
 import { inSpan } from '../observability/tracing';
@@ -10,13 +10,19 @@ import { SqsGateway } from './sqs.gateway';
 
 const BATCH = 10; // limite do SendMessageBatch
 /**
- * Eventos reservados por volta, publicados em lotes de BATCH em paralelo: uma reserva e uma gravação no banco
+ * Eventos reservados por volta, publicados em lotes de BATCH (em paralelo entre wallets, em série dentro de uma): uma reserva e uma gravação no banco
  * para cada 50 eventos, não para cada 10 — sob carga o publisher disputa o pool com o HTTP, e cada ida ao
  * banco a menos encurta o outbox lag.
  */
 const CLAIM = 50;
 /** SQS lento não segura a volta do publisher indefinidamente (nem a reserva do lote). */
 export const SQS_TIMEOUT_MS = 10_000;
+/**
+ * ORM com pool próprio e pequeno, só do publisher: sob saturação do HTTP o outbox lag não fica esperando
+ * conexão no pool principal (e o publisher não toma conexões do HTTP).
+ */
+export const OUTBOX_ORM = Symbol('OUTBOX_ORM');
+export const OUTBOX_POOL = { min: 0, max: 2 };
 /** Reserva do lote: maior que a chamada ao SQS mais a gravação do resultado. Vencida, outro publisher pega. */
 const LEASE_MS = 30_000;
 
@@ -30,15 +36,20 @@ const LEASE_MS = 30_000;
  * fixo (MessageDeduplicationId na FIFO e chave de dedupe do consumidor).
  */
 @Injectable()
-export class OutboxPublisher {
+export class OutboxPublisher implements OnApplicationShutdown {
   private readonly logger = new Logger(OutboxPublisher.name);
 
   constructor(
-    private readonly orm: MikroORM,
+    @Inject(OUTBOX_ORM) private readonly orm: MikroORM,
     private readonly sqs: SqsGateway,
     @Inject(ENV) private readonly env: Env,
     private readonly metrics: Metrics,
   ) {}
+
+  /** Depois do beforeApplicationShutdown dos Workers: nenhuma volta em andamento usa mais o pool. */
+  async onApplicationShutdown(): Promise<void> {
+    await this.orm.close();
+  }
 
   /** Uma volta. Devolve quantos eventos publicou. */
   async publishPending(): Promise<number> {
@@ -57,18 +68,30 @@ export class OutboxPublisher {
         abortSignal.addEventListener('abort', () => reject(new Error(`SQS não respondeu em ${SQS_TIMEOUT_MS} ms`)), { once: true });
       });
       timedOut.catch(() => {}); // a chamada terminou antes: sem "unhandled rejection"
-      // ordenação estável por wallet: os eventos de uma wallet ficam juntos e em ordem no mesmo lote (só uma
-      // wallet com mais de BATCH eventos numa volta atravessa lotes, que saem em paralelo — ordem é melhor esforço)
+      // eventos de uma wallet ficam juntos e em ordem (sort estável sobre a ordem do claim). Lotes de wallets
+      // diferentes saem em paralelo; os que compartilham wallet formam uma "pista" e saem em série, e uma falha
+      // segura o resto da pista: a FIFO recebe os eventos de cada wallet na ordem em que foram gravados.
       const byWallet = claimed.toSorted((x, y) => (x.message.aggregateId < y.message.aggregateId ? -1 : x.message.aggregateId > y.message.aggregateId ? 1 : 0));
       const chunks = Array.from({ length: Math.ceil(byWallet.length / BATCH) }, (_, i) => byWallet.slice(i * BATCH, (i + 1) * BATCH));
-      const results = await inSpan('outbox.publish', { 'messaging.batch.message_count': String(claimed.length) },
-        () => Promise.race([timedOut, Promise.allSettled(chunks.map((chunk) => this.send(chunk, abortSignal)))]));
-      failed = new Set();
-      results.forEach((result, i) => {
-        // só as recusadas voltam: as aceitas já estão na fila, marcá-las de novo só geraria duplicata
-        if (result.status === 'fulfilled') for (const f of result.value.Failed ?? []) failed.add(f.Id!);
-        else for (const { message } of chunks[i]!) failed.add(message.id);
+      const lanes: (typeof chunks)[] = [];
+      chunks.forEach((chunk, i) => {
+        const continues = i > 0 && chunks[i - 1]!.at(-1)!.message.aggregateId === chunk[0]!.message.aggregateId;
+        continues ? lanes.at(-1)!.push(chunk) : lanes.push([chunk]);
       });
+      const sentFailed = new Set<string>();
+      const sendLane = async (lane: typeof chunks) => {
+        for (const [i, chunk] of lane.entries()) {
+          const rejected = abortSignal.aborted
+            ? chunk.map((c) => c.message.id)
+            : await this.send(chunk, abortSignal).then((r) => (r.Failed ?? []).map((f) => f.Id!), () => chunk.map((c) => c.message.id));
+          // só as recusadas voltam: as aceitas já estão na fila, marcá-las de novo só geraria duplicata
+          rejected.forEach((id) => sentFailed.add(id));
+          if (rejected.length > 0) return lane.slice(i + 1).flat().forEach((c) => sentFailed.add(c.message.id));
+        }
+      };
+      await inSpan('outbox.publish', { 'messaging.batch.message_count': String(claimed.length) },
+        () => Promise.race([timedOut, Promise.all(lanes.map(sendLane))]));
+      failed = sentFailed;
       if (failed.size === messages.length) throw new Error('nenhum lote aceito pelo SQS');
     } catch (error) {
       // SQS fora: o lote inteiro entra no backoff em vez de ser tentado em loop
@@ -90,7 +113,7 @@ export class OutboxPublisher {
       Entries: claimed.map(({ message: m, traceparent }) => ({
         Id: m.id,
         MessageBody: JSON.stringify(m.payload),
-        MessageGroupId: m.aggregateId, // agrupa por wallet (ordem é melhor esforço: ARCHITECTURE.md)
+        MessageGroupId: m.aggregateId, // grupo FIFO por wallet: a ordem de envio vale dentro do grupo
         MessageDeduplicationId: m.id,
         MessageAttributes: {
           eventType: { DataType: 'String', StringValue: m.eventType },

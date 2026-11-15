@@ -284,6 +284,14 @@ describe('outbox', () => {
       expect(events).toHaveLength(pending);
       expect(new Set(events.map((e) => e.eventId)).size).toBe(pending);
       expect(events.every((e) => wallets.some((w) => w.id === e.aggregateId))).toBe(true);
+
+      // ordem estrita por wallet: cada wallet tem mais de um lote de 10 e dois publishers disputando, e mesmo
+      // assim a FIFO entrega os eventos dela na ordem em que foram gravados na outbox
+      for (const w of wallets) {
+        const written = await db().find(OutboxMessageEntity, { aggregateId: w.id }, { orderBy: { occurredAt: 'asc', id: 'asc' } });
+        expect(written.length).toBeGreaterThan(10);
+        expect(events.filter((e) => e.aggregateId === w.id).map((e) => e.eventId)).toEqual(written.map((m) => m.id));
+      }
     } finally {
       await other.close();
     }

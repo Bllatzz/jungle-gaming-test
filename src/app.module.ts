@@ -1,4 +1,5 @@
 import { MikroOrmModule } from '@mikro-orm/nestjs';
+import { MikroORM } from '@mikro-orm/postgresql';
 import { type DynamicModule, Logger, Module, type OnApplicationShutdown } from '@nestjs/common';
 import { ENV, type Env } from './config/env';
 import { SqsGateway } from './infrastructure/messaging/sqs.gateway';
@@ -13,7 +14,7 @@ import { OpenWallet } from './application/open-wallet';
 import { ProcessWagerTransaction } from './application/process-wager-transaction';
 import { ReconcileWallet } from './application/reconcile-wallet';
 import { ResolvePendingReferences } from './application/resolve-pending-references';
-import { OutboxPublisher } from './infrastructure/messaging/outbox-publisher';
+import { OUTBOX_ORM, OUTBOX_POOL, OutboxPublisher } from './infrastructure/messaging/outbox-publisher';
 import { WagerConsumer } from './infrastructure/messaging/wager-consumer';
 import { Workers } from './infrastructure/workers/workers';
 import { MetricsRecorder, ReconciliationSource, UnitOfWork } from './application/ports';
@@ -57,6 +58,7 @@ export class AppModule implements OnApplicationShutdown {
           useFactory: (q: ReconciliationSource, m: MetricsRecorder) => new ReconcileWallet(q, m, new Logger(ReconcileWallet.name)),
         },
         WagerConsumer,
+        { provide: OUTBOX_ORM, useFactory: () => MikroORM.init({ ...createOrmConfig(env), pool: OUTBOX_POOL }) },
         OutboxPublisher,
         Workers,
       ],
