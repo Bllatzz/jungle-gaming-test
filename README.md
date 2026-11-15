@@ -136,6 +136,7 @@ conflitos de lock, retries, DLQ e divergências de reconciliação.
 | `test` | Testes de unidade (sem containers) |
 | `test:integration` | Testes de integração (exige `infra:up`) |
 | `test:concurrency` | Testes de concorrência: 3 processos do app ao mesmo tempo, `kill -9` e SIGTERM no meio da carga, e `kill -9` exatamente entre commit e ack (via `FAULT_INJECTION=kill-after-commit`, só para teste) (exige `infra:up`) |
+| `test:e2e` | Diferenciais contra os serviços reais: tokens do Keycloak (auth, `aud`, 401/403) e traces chegando ao Jaeger por OTLP. Sobe `keycloak` e `jaeger` do compose sozinho (exige `infra:up`) |
 | `test:load` | Teste de carga: 3 processos com workers, carga mista por 30s, relatório de throughput, p50/p95/p99, erros, conflitos e outbox lag (exige `infra:up`; `LOAD_CONCURRENCY`, `LOAD_DURATION_S`, `LOAD_WALLETS`). Resultado e análise em [ARCHITECTURE.md](ARCHITECTURE.md#teste-de-carga) |
 
 Mapa dos 8 cenários de concorrência do desafio: os itens 1 a 5, 7 e 8 estão em `test/concurrency`; o 6

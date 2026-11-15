@@ -84,7 +84,7 @@ de sessão, então some se o processo morrer. O serviço `migrate` do compose co
 
 | Fila | Papel |
 |---|---|
-| `wager-transactions.fifo` | Entrada de transações. `VisibilityTimeout=30`; o app manda para a DLQ no 5º recebimento com falha, redrive após 10 como rede de segurança |
+| `wager-transactions.fifo` | Entrada de transações. `VisibilityTimeout=30`; o app manda para a DLQ na 5ª falha de bug ou depois de 30 min de erro transitório (ver [Consumer](#consumer-wager-transactionsfifo)); redrive após 100 recebimentos como rede de segurança |
 | `wager-transactions-dlq.fifo` | Mensagens com falha permanente ou que esgotaram as tentativas |
 | `wallet-events.fifo` | Saída: destino dos eventos publicados pela outbox. O desafio pede publicação mas não define o destino; decisão nossa |
 
@@ -199,13 +199,15 @@ juntas ou nenhuma, senão o boot falha). Desligada, o `AuthGuard` deixa tudo pas
   confiável, §2); o `providerId` da mensagem segue validado pelo domínio.
 - **Emissor fixo:** `KC_HOSTNAME=http://localhost:8180` faz o `iss` ser o mesmo para token pedido no
   host ou dentro da rede do compose; o app no container busca a JWKS em `keycloak:8080`.
+- Audience: o guard exige `aud = wagering-api`; o realm tem um mapper de audience em cada client. Token
+  que o mesmo IdP emitiu para outro serviço → 401.
 - Testes (`test/integration/auth.test.ts`): um IdP de mentira publica uma JWKS real e os testes assinam
-  tokens RS256; cobre todos os 401, os 403, o 404 entre provedores e o 503 com o IdP fora. O fluxo com o
-  Keycloak de verdade foi conferido à mão (token por client credentials → 201/200; token do
-  `provider-b` com payload do `provider-a` → 403), mas não entra na suíte automática para não exigir o
-  Keycloak (~20 s de boot) em toda execução.
-- Limitações: sem checagem de `aud` (o Keycloak põe `account` por padrão; em produção, um mapper de
-  audience e `audience` no `jwtVerify`); wallets não pertencem a provedor, então qualquer provedor
+  tokens RS256; cobre todos os 401 (inclusive `aud` errado), os 403, o 404 entre provedores e o 503 com o
+  IdP fora. Contra o Keycloak de verdade: `bun run test:e2e` (`test/e2e`) sobe Keycloak e Jaeger do
+  compose e confere token por client credentials → 201/200, sem token → 401, token do `provider-b` com
+  payload do `provider-a` → 403, o `aud` no token real, e o span da requisição chegando ao Jaeger por
+  OTLP. Fica fora de `test:integration` para não exigir o Keycloak (~20 s de boot) em toda execução.
+- Limitações: wallets não pertencem a provedor, então qualquer provedor
   autenticado lê ou abre qualquer wallet; sem escopos/papéis (todo client pode tudo nas suas transações).
 
 ## Domínio (`src/domain`)
@@ -257,13 +259,16 @@ que falha decide:
    - o tipo não aceita referência (ex.: BET) ou a transação referencia a si mesma →
      `REFERENCE_INVALID_KIND` na hora (esperar não resolveria);
    - referência de outro player/wallet/moeda/rodada → `REFERENCE_MISMATCH`, mesmo que ela
-     ainda esteja pendente. Outro *provider* não chega aqui: a referência é procurada por
-     `(providerId, referenceExternalTransactionId)` (regra 2), então a transação de outro provider é
-     invisível e conta como ausente (`PENDING_REFERENCE`, e `REFERENCE_NOT_FOUND` no fim do prazo).
-     De propósito: o id externo é do espaço de nomes de cada provider, e dois providers podem usar o
-     mesmo id. Rejeitar na hora porque "existe em outro provider" recusaria uma reversão legítima cuja
-     referência ainda está em voo (regra 8). É a leitura literal das regras 2 e 8: resolvida por
-     `(providerId, …)`, a referência simplesmente não existe para este provider;
+     ainda esteja pendente;
+   - referência de outro *provider* na mesma wallet → também `REFERENCE_MISMATCH`, na hora. A busca é
+     por `(providerId, referenceExternalTransactionId)` (regra 2); só se ela não achar nada é que se
+     procura uma transação com esse id externo de outro provider **na mesma wallet** (`findReference`,
+     índice `(wallet_id, external_transaction_id)`). Achou: o provider apontou para a transação de outro,
+     e a regra 2 ("deve pertencer ao mesmo provider") a recusa já, com um código que diz o porquê, em vez
+     de 202 por ~4 min e `REFERENCE_NOT_FOUND`. Trade-off: se outro provider tiver, por coincidência, uma
+     transação com o mesmo id externo na mesma wallet **e** a referência legítima ainda estiver em voo, a
+     reversão é recusada (o provider reenvia com outro id). Fora da mesma wallet, a de outro provider
+     continua invisível (ausente → `PENDING_REFERENCE`, regra 8);
    - referência de tipo não permitido (ex.: REFUND de um WIN) → `REFERENCE_INVALID_KIND`, também
      mesmo pendente (o tipo dela não muda esperando);
    - ausente ou ainda não aplicada → `PENDING_REFERENCE`;
@@ -289,7 +294,7 @@ violações de contrato e erros de programação.
 | `WALLET_PLAYER_MISMATCH` | Player não é o dono da wallet | Corrigir o payload |
 | `REFERENCE_NOT_FOUND` | Referência não chegou no prazo (10 tentativas, ~4 min) | Reenviar a referência ou desistir |
 | `REFERENCE_NOT_PROCESSED` | Referência existe, mas foi rejeitada/falhou (ou continuou pendente até o prazo) | Não reenviar |
-| `REFERENCE_MISMATCH` | Referência de outro player/wallet/moeda/rodada (outro provider conta como ausente) | Corrigir o payload |
+| `REFERENCE_MISMATCH` | Referência de outro provider/player/wallet/moeda/rodada | Corrigir o payload |
 | `REFERENCE_INVALID_KIND` | Tipo de referência não permitido | Corrigir o payload |
 | `REFERENCE_ALREADY_REVERSED` | A referência já tem um REFUND ou ROLLBACK aplicado (inclusive WIN/LOSS sobre BET já devolvida) | Não reenviar |
 | `AMOUNT_MISMATCH` | Valor da reversão diferente da referência | Corrigir o payload |
@@ -316,6 +321,25 @@ recebe 503/500 (HTTP) ou a mensagem vai para retry/DLQ.
 - Saldo que estouraria `NUMERIC(20,2)` é recusado no domínio, antes de chegar ao banco.
 
 ## Persistência (`src/infrastructure/persistence`)
+
+### Migrations
+
+O texto cita as migrations pelo número de ordem; o arquivo correspondente é este:
+
+| Nº | Arquivo | O quê |
+|---|---|---|
+| 1 | `Migration20261114120000` | schema inicial: tabelas, CHECKs, UNIQUEs, ledger append-only |
+| 2 | `Migration20261114130000` | `observed_balance` (replay da regra 7) e `wallet_version` no ledger |
+| 3 | `Migration20261114140000` | agenda do worker de `PENDING_REFERENCE` |
+| 4 | `Migration20261114150000` | `outbox_due_idx` (claim do publisher) |
+| 5 | `Migration20261114160000` | partidas dobradas (`ledger_postings`) |
+| 6 | `Migration20261115100000` | regras 2 e 4 no banco, abertura idempotente, `consumer_message_failures` |
+| 7 | `Migration20261115110000` | saldo == ledger no commit (constraint triggers deferidos) |
+| 8 | `Migration20261115120000` | `traceparent` na outbox |
+| 9 | `Migration20261115130000` | role de runtime e grants |
+| 10 | `Migration20261115140000` | índice da cabeça por wallet na outbox |
+| 11 | `Migration20261115150000` | `seq` da outbox (ordem sem relógio) e default privileges |
+| 12 | `Migration20261115160000` | índice `(wallet_id, external_transaction_id)` para referência de outro provider |
 
 ### Mapeamento
 
@@ -413,7 +437,8 @@ mesma moeda. Débitos = créditos em cada transação, logo no livro inteiro, e 
   débitos ≠ créditos para alguma transação (as duas pernas entram em comandos separados, por isso deferido).
 - Append-only (trigger bloqueia `UPDATE`, `DELETE`, `TRUNCATE`); `UNIQUE (transaction_id, account)`.
 - Migration em banco com dados: os lançamentos antigos ganham as duas pernas no `up`.
-- A invariante final das suítes (`walletsDivergingFromLedger`) confere também saldo == conta da wallet
+- A invariante (`walletsDivergingFromLedger`) roda depois de **cada** teste das suítes de integração e
+  concorrência (`checkLedgerInvariantAfterEach`), não só no fim, e confere também saldo == conta da wallet
   nas partidas; `schema.test.ts` confere as pernas de cada tipo, o balancete do banco inteiro (Σ = 0),
   a partida que não fecha e o append-only.
 - Custo: 2 inserts a mais por movimento, dentro do lock da wallet (ver Teste de carga).
@@ -594,7 +619,7 @@ Uma regra só decide o destino da mensagem: **ack quando o desfecho está no ban
 | PROCESSED, REJECTED (regra de negócio), PENDING_REFERENCE, replay | commit → `DeleteMessage` (ack) |
 | JSON inválido, `type` desconhecido, payload inválido, wallet inexistente, conflito de idempotência, `messageId` reutilizado com outro payload | nada pode ser gravado → DLQ na hora, com atributo `errorCode` |
 | Transitório (banco fora, lock timeout…) ou erro inesperado | sem ack; `ChangeMessageVisibility` com backoff 1s, 2s, 4s… (teto 60s) |
-| 9ª falha **transitória** da mesma mensagem (~3 min de backoff) | DLQ com `RETRIES_EXHAUSTED` |
+| Erro **transitório** que dura mais que o TTL (30 min desde o 1º recebimento) | DLQ com `RETRIES_EXHAUSTED` |
 | 5ª falha **não transitória** (bug) da mesma mensagem | DLQ com `PROCESSING_FAILED` |
 
 - **Inbox:** gravado dentro da mesma transação de wallet, ledger e outbox. O hash guardado é o do
@@ -605,18 +630,21 @@ Uma regra só decide o destino da mensagem: **ack quando o desfecho está no ban
   (`test/concurrency/crash-after-commit.test.ts`: o processo roda com `FAULT_INJECTION=kill-after-commit`
   e se mata com SIGKILL logo depois do commit; outro processo recebe a redelivery). O ponto de injeção
   é uma linha no consumer, só ativa com a variável (validada no boot), nunca em produção.
-- **Limite de tentativas** no app, com dois orçamentos: `MAX_TRANSIENT_RECEIVES = 9` para erro
-  transitório (banco fora, lock timeout) e `MAX_RECEIVES = 5` para o resto (bug). Com o backoff
-  1+2+4+8+16+32+60+60 s, uma queda do Postgres de até ~3 min (restart, failover) não manda mensagem
-  válida para a DLQ: ela é aplicada quando o backoff vencer depois da volta do banco (teste: queda no 5º
-  recebimento e volta → aplicada, DLQ vazia; medido também com o Postgres parado por 40 s). Queda maior
-  que isso vai para a DLQ com `RETRIES_EXHAUSTED` e exige redrive. As falhas são contadas pelo app em
+- **Limite de tentativas** no app, com dois orçamentos. Erro transitório (banco fora, lock timeout)
+  tem limite de **tempo**: `SQS_TRANSIENT_RETRY_TTL_SECONDS` (padrão 1800 = 30 min) desde o
+  `ApproximateFirstReceiveTimestamp`, com backoff 1, 2, 4… até 60 s, e a última espera cortada para cair
+  no fim do prazo. Uma queda do Postgres de até 30 min não manda mensagem válida para a DLQ: ela é
+  aplicada quando o banco volta. Por tempo, e não por contagem, porque com o banco fora as irmãs do mesmo
+  grupo também acumulam recebimentos (voltam junto com a cabeça): um limite de contagem as mandaria para
+  a DLQ em cascata assim que a cabeça fosse. Testes: 12 recebimentos com o banco fora dentro do prazo →
+  continua em retry; passado o prazo → `RETRIES_EXHAUSTED`; queda no 5º recebimento e volta → aplicada.
+  O resto (bug) tem `MAX_RECEIVES = 5` falhas. As falhas são contadas pelo app em
   `consumer_message_failures (consumer, messageId)`, numa transação própria (a do negócio foi
   desfeita). Não pelo `ApproximateReceiveCount`: ele também sobe quando a mensagem só é devolvida sem
   processar (irmã de grupo bloqueado, orçamento do lote, shutdown), e uma mensagem que nunca falhou
-  chegaria à DLQ por isso. Com o banco fora não dá para contar: aí vale o `ApproximateReceiveCount`
-  (fallback). A redrive policy (`maxReceiveCount = 10`) fica de rede de segurança, acima dos dois
-  limites. A linha da contagem é apagada quando a mensagem tem desfecho (ack ou DLQ).
+  chegaria à DLQ por isso. Com o banco fora não dá para contar: aí o backoff usa o
+  `ApproximateReceiveCount` (fallback). A redrive policy (`maxReceiveCount = 100`) fica de rede de
+  segurança, acima do que 30 min de retry consomem (~35 recebimentos). A linha da contagem é apagada quando a mensagem tem desfecho (ack ou DLQ).
 - **Ack falhou depois do commit:** só log, e a mensagem volta na hora (visibilidade 0) para cair no
   replay. Nunca vai para a DLQ: o efeito já está gravado.
 - **Lote demorado:** o receive pede 30 s de visibilidade e o lote para em 20 s; o resto volta para a
@@ -864,6 +892,8 @@ referência não tem como ser checado e é pago (a referência é opcional no WI
 - A auditoria periódica varre o banco inteiro (agregação do ledger e das partidas) a cada 5 min em
   cada instância, com `statement_timeout` de 30 s. Com um ledger muito grande, o próximo passo é
   varrer por lotes de wallets ou só wallets alteradas desde a última volta.
-- Com o Postgres fora, o consumer não consegue contar falhas e volta a usar o `ApproximateReceiveCount`
-  (o comportamento antigo, sem o desconto das mensagens só devolvidas). O orçamento transitório (9) segura
-  ~3 min de queda; acima disso a mensagem vai para a DLQ e precisa de redrive manual.
+- Queda do Postgres maior que o TTL transitório (30 min, configurável) manda as mensagens para a DLQ com
+  `RETRIES_EXHAUSTED`, e elas precisam de redrive manual. O enunciado pede um limite antes da DLQ; quem
+  precisar de mais folga aumenta `SQS_TRANSIENT_RETRY_TTL_SECONDS` (e a redrive, se passar de ~1 h).
+- A redrive alta (100) é o preço do TTL: uma mensagem que derruba o processo antes de qualquer `catch`
+  (crash, não exceção) volta até 100 vezes antes de o SQS movê-la para a DLQ.
